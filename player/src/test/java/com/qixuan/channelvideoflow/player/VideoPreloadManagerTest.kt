@@ -9,6 +9,7 @@ import com.qixuan.channelvideoflow.domain.media.PreloadOwnerHandoffPhase
 import com.qixuan.channelvideoflow.domain.media.NextPreloadBudgetController
 import com.qixuan.channelvideoflow.domain.media.NextPreloadBudgetTier
 import com.qixuan.channelvideoflow.domain.media.NextPreloadSafetySnapshot
+import com.qixuan.channelvideoflow.domain.media.NextPreloadStopReason
 import com.qixuan.channelvideoflow.domain.media.PlaybackRiskState
 import com.qixuan.channelvideoflow.domain.media.TelegramFileDeleteResult
 import com.qixuan.channelvideoflow.domain.media.TelegramFileGateway
@@ -18,6 +19,7 @@ import com.qixuan.channelvideoflow.domain.media.TelegramFileRangeLease
 import com.qixuan.channelvideoflow.domain.media.TelegramFileRequestPriority
 import com.qixuan.channelvideoflow.domain.media.TelegramFileSnapshot
 import com.qixuan.channelvideoflow.model.video.IndexedVideo
+import com.qixuan.channelvideoflow.model.video.TelegramMediaFileReference
 import com.qixuan.channelvideoflow.model.video.VideoKey
 import com.qixuan.channelvideoflow.model.video.VideoPlaybackVariant
 import java.util.concurrent.CopyOnWriteArrayList
@@ -44,7 +46,7 @@ class VideoPreloadManagerTest {
     }
 
     @Test
-    fun dynamicBudgetUsesBoundedChunksAndNeverExceedsTenMib() = runTest {
+    fun dynamicBudgetUsesBoundedChunksAndNeverExceedsTwentyMib() = runTest {
         val scope = TestScope(StandardTestDispatcher(testScheduler))
         val gateway = FakeGateway()
         val manager = VideoPreloadManager(
@@ -63,10 +65,10 @@ class VideoPreloadManagerTest {
         advanceUntilIdle()
 
         val requests = gateway.requests.filter { it.fileId == 40 }
-        assertEquals(10L * 1024L * 1024L, requests.sumOf(Request::length))
+        assertEquals(20L * 1024L * 1024L, requests.sumOf(Request::length))
         assertTrue(requests.all { it.length <= NextPreloadBudgetController.RANGE_CHUNK_BYTES })
-        assertEquals(NextPreloadBudgetTier.TEN_MIB, manager.currentBudgetDecision()?.allowedBudgetTier)
-        assertEquals(10L * 1024L * 1024L, manager.currentBudgetDecision()?.downloadedNewNetworkBytes)
+        assertEquals(NextPreloadBudgetTier.TWENTY_MIB, manager.currentBudgetDecision()?.allowedBudgetTier)
+        assertEquals(20L * 1024L * 1024L, manager.currentBudgetDecision()?.requestedUncachedBytes)
         scope.cancel()
     }
 
@@ -89,7 +91,7 @@ class VideoPreloadManagerTest {
         manager.updateCurrentPlaybackSafety(safe(20.0))
         advanceUntilIdle()
         assertTrue(gateway.requests.isNotEmpty())
-        manager.updateCurrentPlaybackSafety(safe(7.0))
+        manager.updateCurrentPlaybackSafety(safe(2.5))
         advanceUntilIdle()
         assertEquals(0, gateway.activeLeases)
         assertEquals(NextPreloadBudgetTier.BLOCKED, manager.currentBudgetDecision()?.allowedBudgetTier)
@@ -120,7 +122,7 @@ class VideoPreloadManagerTest {
 
         assertEquals(1L * 1024L * 1024L, gateway.requests.first().offset)
         assertEquals(1L * 1024L * 1024L, manager.currentBudgetDecision()?.cachedCoveredBytes)
-        assertTrue(manager.currentBudgetDecision()!!.downloadedNewNetworkBytes <= 1L * 1024L * 1024L)
+        assertTrue(manager.currentBudgetDecision()!!.requestedUncachedBytes <= 1L * 1024L * 1024L)
         scope.cancel()
     }
 
@@ -603,6 +605,299 @@ class VideoPreloadManagerTest {
                 fileSize = 20_000L,
             ),
         )
+    }
+
+    @Test
+    fun startupSafetyWithoutAFirstFrameStillIssuesOneBoundedPrefixForTheNextTarget() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val gateway = FakeGateway()
+        val manager = VideoPreloadManager(
+            gateway = gateway,
+            adaptivePolicy = FakeAdaptivePolicy(conservativeDecision()),
+            scope = scope,
+            dynamicNextPreloadEnabled = true,
+            initialSafety = safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+
+        manager.setNextVideo(video(50))
+        advanceUntilIdle()
+
+        assertEquals(listOf(50), gateway.requests.map(Request::fileId))
+        assertEquals(
+            listOf(AdaptivePreloadPolicyStateMachine.CONSERVATIVE_PRELOAD_BYTES),
+            gateway.requests.map(Request::length),
+        )
+        assertEquals(
+            NextPreloadBudgetTier.CONSERVATIVE_STARTUP,
+            manager.currentBudgetDecision()?.allowedBudgetTier,
+        )
+        assertEquals(
+            NextPreloadBudgetController.MIN_PROGRESSIVE_BYTES,
+            manager.currentBudgetDecision()?.requestedUncachedBytes,
+        )
+        scope.cancel()
+    }
+
+    @Test
+    fun loadingSnapshotsForTheCurrentItemDoNotCancelADifferentNextTarget() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val gateway = FakeGateway()
+        val manager = VideoPreloadManager(
+            gateway = gateway,
+            adaptivePolicy = FakeAdaptivePolicy(conservativeDecision()),
+            scope = scope,
+            ownerPromotionEnabled = false,
+            dynamicNextPreloadEnabled = true,
+            initialSafety = safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+        val current = video(60)
+        val next = video(61)
+
+        manager.setNextVideo(next)
+        advanceUntilIdle()
+        val requestsBefore = gateway.requests.size
+
+        repeat(4) { manager.onCurrentPlaybackStarting(current) }
+        advanceUntilIdle()
+
+        assertEquals(requestsBefore, gateway.requests.size)
+        assertTrue("a different next target must keep its speculative owner", gateway.closedFileIds.isEmpty())
+        assertEquals(next.key, manager.ownerHandoff.value.key)
+        scope.cancel()
+    }
+
+    @Test
+    fun theItemThatBecomesCurrentStillReleasesItsOwnSpeculativeOwner() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val gateway = FakeGateway()
+        val manager = VideoPreloadManager(
+            gateway = gateway,
+            adaptivePolicy = FakeAdaptivePolicy(conservativeDecision()),
+            scope = scope,
+            ownerPromotionEnabled = false,
+            dynamicNextPreloadEnabled = true,
+            initialSafety = safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+        val promoted = video(62)
+
+        manager.setNextVideo(promoted)
+        advanceUntilIdle()
+        manager.onCurrentPlaybackStarting(promoted)
+        advanceUntilIdle()
+
+        assertEquals(listOf(62), gateway.closedFileIds)
+        assertEquals(0, gateway.activeLeases)
+        // Cancelling the speculative owner must not refund the target's lifetime accounting: the
+        // pool that takes this target over inherits exactly these bytes.
+        assertEquals(
+            NextPreloadBudgetController.MIN_PROGRESSIVE_BYTES,
+            manager.requestedBytesFor(promoted),
+        )
+        scope.cancel()
+    }
+
+    @Test
+    fun startupBytePrefixStillHonoursEveryHardBlock() = runTest {
+        listOf(
+            "metered opt-out" to safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = false,
+            ),
+            "rebuffer" to safe(0.0).copy(playbackState = PlaybackRiskState.REBUFFER),
+            "seek" to safe(0.0).copy(playbackState = PlaybackRiskState.SEEK),
+            "memory pressure" to safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                hasMemoryPressure = true,
+            ),
+        ).forEach { (label, safety) ->
+            val scope = TestScope(StandardTestDispatcher(testScheduler))
+            val gateway = FakeGateway()
+            val manager = VideoPreloadManager(
+                gateway = gateway,
+                adaptivePolicy = FakeAdaptivePolicy(conservativeDecision()),
+                scope = scope,
+                dynamicNextPreloadEnabled = true,
+                initialSafety = safety,
+            )
+
+            manager.setNextVideo(video(63))
+            advanceUntilIdle()
+
+            assertTrue("$label must not issue a next-payload request", gateway.requests.isEmpty())
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun offlinePolicyBlocksTheStartupPrefixEvenWithMobilePreloadOptedIn() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val gateway = FakeGateway()
+        val policy = FakeAdaptivePolicy(
+            conservativeDecision().copy(
+                state = AdaptivePreloadState.OFF,
+                reason = AdaptivePreloadReason.OFFLINE,
+                maxPreloadBytes = 0L,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+        val manager = VideoPreloadManager(
+            gateway = gateway,
+            adaptivePolicy = policy,
+            scope = scope,
+            dynamicNextPreloadEnabled = true,
+            initialSafety = safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+
+        manager.setNextVideo(video(70))
+        advanceUntilIdle()
+
+        assertTrue("an offline policy must issue nothing", gateway.requests.isEmpty())
+        assertEquals(0, gateway.activeLeases)
+        assertEquals(NextPreloadBudgetTier.BLOCKED, manager.currentBudgetDecision()?.allowedBudgetTier)
+        assertEquals(
+            NextPreloadStopReason.ADAPTIVE_HARD_BLOCK,
+            manager.currentBudgetDecision()?.preloadStopReason,
+        )
+        scope.cancel()
+    }
+
+    @Test
+    fun policyTurningHardBlockedMidFlightRevokesAnAlreadyIssuedPrefix() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val gateway = FakeGateway()
+        val policy = FakeAdaptivePolicy(normalDecision())
+        val manager = VideoPreloadManager(
+            gateway = gateway,
+            adaptivePolicy = policy,
+            scope = scope,
+            dynamicNextPreloadEnabled = true,
+            initialSafety = safe(20.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+
+        manager.setNextVideo(video(71))
+        advanceUntilIdle()
+        val issued = gateway.requests.sumOf(Request::length)
+        assertTrue("the allowed startup stage must issue its bounded prefix", issued > 0L)
+
+        policy.mutable.value = offDecision(AdaptivePreloadReason.NETWORK_CHANGED)
+        advanceUntilIdle()
+
+        assertEquals(0, gateway.activeLeases)
+        assertTrue(gateway.closedFileIds.isNotEmpty())
+        assertEquals(NextPreloadBudgetTier.BLOCKED, manager.currentBudgetDecision()?.allowedBudgetTier)
+
+        // A later re-registration of the same target must stay blocked while the hard block lasts.
+        manager.setNextVideo(video(71))
+        advanceUntilIdle()
+        assertEquals(issued, gateway.requests.sumOf(Request::length))
+        scope.cancel()
+    }
+
+    @Test
+    fun lightweightStartupStageNeverRequestsAnHlsManifest() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val gateway = FakeGateway()
+        val manager = VideoPreloadManager(
+            gateway = gateway,
+            adaptivePolicy = FakeAdaptivePolicy(conservativeDecision()),
+            scope = scope,
+            dynamicNextPreloadEnabled = true,
+            initialSafety = safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+        val manifestFileId = 801
+        val hlsTarget = video(80).copy(
+            alternativeVariants = listOf(
+                VideoPlaybackVariant(
+                    fileId = 800,
+                    remoteUniqueId = "alternative-800",
+                    fileSize = 128L * 1024L,
+                    width = 640,
+                    height = 360,
+                    codec = "h264",
+                    hlsManifestFile = TelegramMediaFileReference(
+                        fileId = manifestFileId,
+                        remoteUniqueId = "manifest-800",
+                        fileSize = 200L * 1024L,
+                    ),
+                ),
+            ),
+        )
+
+        manager.setNextVideo(hlsTarget)
+        advanceUntilIdle()
+
+        // The whole lightweight stage is one progressive prefix: no manifest range, and therefore
+        // no uncharged request stacked on top of the flat ceiling and no fallback after failure.
+        assertTrue(
+            "no manifest range may be requested during the startup stage",
+            gateway.requests.none { it.fileId == manifestFileId },
+        )
+        assertEquals(listOf(80), gateway.requests.map(Request::fileId))
+        assertTrue(gateway.requests.all { it.length <= NextPreloadBudgetController.MIN_PROGRESSIVE_BYTES })
+        scope.cancel()
+    }
+
+    @Test
+    fun requestedBytesAreHandedOverPerExactTarget() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val gateway = FakeGateway()
+        val manager = VideoPreloadManager(
+            gateway = gateway,
+            adaptivePolicy = FakeAdaptivePolicy(conservativeDecision()),
+            scope = scope,
+            dynamicNextPreloadEnabled = true,
+            initialSafety = safe(0.0).copy(
+                playbackState = PlaybackRiskState.STARTUP,
+                isMobileNetwork = true,
+                isMetered = true,
+                mobileDataPreloadEnabled = true,
+            ),
+        )
+        val target = video(90)
+
+        assertEquals(0L, manager.requestedBytesFor(target))
+        manager.setNextVideo(target)
+        advanceUntilIdle()
+
+        assertEquals(
+            NextPreloadBudgetController.MIN_PROGRESSIVE_BYTES,
+            manager.requestedBytesFor(target),
+        )
+        // A different item must not inherit the ledger of its predecessor.
+        assertEquals(0L, manager.requestedBytesFor(video(91)))
+        scope.cancel()
     }
 
     private fun video(fileId: Int) = IndexedVideo(

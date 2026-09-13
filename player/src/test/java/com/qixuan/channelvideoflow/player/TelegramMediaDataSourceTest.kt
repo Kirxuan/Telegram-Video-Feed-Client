@@ -28,6 +28,23 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 class TelegramMediaDataSourceTest {
     @Test
+    fun extractorCanReadTheFirstHeaderBeforeTheFullRollingChunkArrives() {
+        val path = tempFile("x".repeat(64 * 1024))
+        val gateway = FakeGateway(partialSnapshot(path, 1024L * 1024L, 64L * 1024L))
+        val source = TelegramMediaDataSource(gateway, isMainThread = { false }, fileIdOverride = 1)
+        try {
+            source.open(DataSpec(TestUri(), 0, C.LENGTH_UNSET.toLong()))
+            val header = ByteArray(16)
+            assertEquals(16, source.read(header, 0, header.size))
+            assertArrayEquals("x".repeat(16).toByteArray(), header)
+            assertEquals(1024L * 1024L, gateway.readAheadBytes.single())
+        } finally {
+            source.close()
+            java.io.File(path).delete()
+        }
+    }
+
+    @Test
     fun samplePreloadSessionStartsAsNextAndPromotesFutureRangesToCurrent() {
         val path = tempFile("0123456789")
         val gateway = FakeGateway(snapshot(path, 10))

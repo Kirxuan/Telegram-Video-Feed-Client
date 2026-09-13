@@ -2,8 +2,6 @@ package com.qixuan.channelvideoflow.telegram.media
 
 import android.util.Log
 import com.qixuan.channelvideoflow.database.MediaCacheEntryDao
-import com.qixuan.channelvideoflow.database.MediaCacheEntryEntity
-import com.qixuan.channelvideoflow.database.VideoIndexDao
 import com.qixuan.channelvideoflow.domain.cache.MediaCacheController
 import com.qixuan.channelvideoflow.domain.cache.MediaCacheEntry
 import com.qixuan.channelvideoflow.domain.cache.MediaCacheEvictionPlanner
@@ -41,7 +39,6 @@ internal class TdLibMediaCacheManager @Inject constructor(
     private val client: TelegramFileClient,
     private val gateway: TelegramFileGateway,
     private val cacheEntryDao: MediaCacheEntryDao,
-    private val videoIndexDao: VideoIndexDao,
     private val preferences: MediaCachePreferences,
     private val policySource: DevicePreloadPolicySource,
     private val privateSizer: PrivateMediaCacheSizer,
@@ -81,7 +78,6 @@ internal class TdLibMediaCacheManager @Inject constructor(
             client.fileEvents.collect { event ->
                 when (event) {
                     TelegramFileClientEvent.Ready -> {
-                        reconcileIndexedFiles()
                         refresh()
                         trimToLimit()
                     }
@@ -234,28 +230,6 @@ internal class TdLibMediaCacheManager @Inject constructor(
             delay(REFRESH_DEBOUNCE_MILLIS)
             refresh()
             if (mutableState.value.usedBytes > mutableState.value.limitBytes) trimToLimit()
-        }
-    }
-
-    private suspend fun reconcileIndexedFiles() {
-        videoIndexDao.getAllIndexedVideoFileIds().forEach { fileId ->
-            if (cacheEntryDao.get(fileId) != null) return@forEach
-            when (val file = client.getFile(fileId)) {
-                is TelegramClientResult.Success -> {
-                    if (file.value.downloadedSize <= 0L || file.value.localPath == null) {
-                        return@forEach
-                    }
-                    cacheEntryDao.upsert(
-                        MediaCacheEntryEntity(
-                            fileId = fileId,
-                            cachedBytes = file.value.downloadedSize,
-                            lastAccessedAtMillis =
-                                privateSizer.safeLastModified(file.value.localPath),
-                        ),
-                    )
-                }
-                is TelegramClientResult.Failure -> Unit
-            }
         }
     }
 

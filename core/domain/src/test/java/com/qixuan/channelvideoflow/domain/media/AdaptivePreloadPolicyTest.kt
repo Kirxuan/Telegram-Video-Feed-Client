@@ -6,10 +6,18 @@ import org.junit.Test
 
 class AdaptivePreloadPolicyTest {
     @Test
-    fun currentItemAlwaysYieldsUntilFirstFrameThenRecoversWithHysteresis() {
+    fun currentItemHoldsBoundedReserveUntilFirstFrameThenRecoversWithHysteresis() {
         val policy = AdaptivePreloadPolicyStateMachine(wifiEnvironment())
 
-        assertDecision(policy.onCurrentBind(cacheHit = true), AdaptivePreloadState.OFF, 0L)
+        // Before the current item renders its first frame the policy degrades to the bounded
+        // conservative reserve instead of a hard block: a hard block for the entire startup
+        // window starved the next item and forced a cold start on every slow video (device
+        // evidence, 2026-09-11). The NEXT_PRELOAD priority keeps it from stealing link capacity.
+        assertDecision(
+            policy.onCurrentBind(cacheHit = true),
+            AdaptivePreloadState.CONSERVATIVE,
+            AdaptivePreloadPolicyStateMachine.CONSERVATIVE_PRELOAD_BYTES,
+        )
         assertEquals(true, policy.decision.isUnmeteredWifi)
         assertEquals(
             AdaptivePreloadReason.CURRENT_NOT_STABLE,
@@ -29,6 +37,28 @@ class AdaptivePreloadPolicyTest {
             AdaptivePreloadState.NORMAL,
             AdaptivePreloadPolicyStateMachine.NORMAL_PRELOAD_BYTES,
         )
+    }
+
+    @Test
+    fun hardBlocksRemainOffEvenBeforeFirstFrame() {
+        // The bounded reserve is only for the "waiting for first frame" window. True hard
+        // blocks (offline, device pressure, network change, failures, rebuffer) still stop the
+        // preloader entirely regardless of first-frame state.
+        val policy = AdaptivePreloadPolicyStateMachine(
+            AdaptivePreloadEnvironment(
+                signals = DevicePreloadSignals(
+                    network = NetworkTransport.WIFI,
+                    isMemoryLow = true,
+                ),
+                mobileDataEnabled = false,
+                qualityPreference = VideoQualityPreference.AUTO,
+            ),
+        )
+        assertEquals(AdaptivePreloadState.OFF, policy.decision.state)
+        assertEquals(AdaptivePreloadReason.MEMORY_LOW, policy.decision.reason)
+        val afterBind = policy.onCurrentBind(cacheHit = true)
+        assertEquals(AdaptivePreloadState.OFF, afterBind.state)
+        assertEquals(AdaptivePreloadReason.MEMORY_LOW, afterBind.reason)
     }
 
     @Test

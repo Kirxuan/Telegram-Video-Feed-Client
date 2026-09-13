@@ -7,13 +7,60 @@ import com.qixuan.channelvideoflow.model.video.TagSummary
 import com.qixuan.channelvideoflow.model.video.VideoFilter
 import com.qixuan.channelvideoflow.model.video.VideoKey
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+
+enum class RepositoryObservationFailure {
+    DATABASE,
+    UNKNOWN,
+}
+
+data class RepositoryObservation<T>(
+    val value: T,
+    val failure: RepositoryObservationFailure? = null,
+) {
+    val isFailure: Boolean get() = failure != null
+}
+
+data class VideoFeedKeySnapshot(
+    val key: VideoKey,
+    val publishTime: Long,
+    val editTime: Long?,
+)
 
 interface TelegramMessageRepository {
     val scanProgress: Flow<List<ChannelVideoScanProgress>>
 
+    val scanProgressObservation: Flow<RepositoryObservation<List<ChannelVideoScanProgress>>>
+        get() = scanProgress.map { value -> RepositoryObservation(value) }
+
     fun observeVideos(filter: VideoFilter): Flow<List<IndexedVideo>>
 
+    fun observeVideoObservation(
+        filter: VideoFilter,
+    ): Flow<RepositoryObservation<List<IndexedVideo>>> =
+        observeVideos(filter).map { value -> RepositoryObservation(value) }
+
+    fun observeVideoKeyObservation(
+        filter: VideoFilter,
+    ): Flow<RepositoryObservation<List<VideoFeedKeySnapshot>>> =
+        observeVideoObservation(filter).map { observation ->
+            RepositoryObservation(
+                value = observation.value.map { video ->
+                    VideoFeedKeySnapshot(video.key, video.publishTime, video.editTime)
+                },
+                failure = observation.failure,
+            )
+        }
+
+    suspend fun hydrateVideos(keys: List<VideoKey>): RepositoryObservation<List<IndexedVideo>> =
+        RepositoryObservation(emptyList(), RepositoryObservationFailure.UNKNOWN)
+
     fun observeTags(channelIds: Set<Long>): Flow<List<TagSummary>>
+
+    fun observeTagObservation(
+        channelIds: Set<Long>,
+    ): Flow<RepositoryObservation<List<TagSummary>>> =
+        observeTags(channelIds).map { value -> RepositoryObservation(value) }
 
     /**
      * Re-resolves the current Telegram message into an app-owned result that

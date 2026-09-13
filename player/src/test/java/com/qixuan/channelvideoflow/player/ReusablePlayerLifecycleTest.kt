@@ -2,9 +2,35 @@ package com.qixuan.channelvideoflow.player
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ReusablePlayerLifecycleTest {
+    @Test
+    fun standbyPreparesSilentlyAndHundredsOfPromotionsReuseExactlyTwoEngines() {
+        val engines = mutableListOf<FakeReusablePlayerEngine>()
+        val lifecycle = ReusablePlayerLifecycle(
+            factory = { FakeReusablePlayerEngine().also(engines::add) },
+            startOrder = PlaybackStartOrder.PREPARE_THEN_PLAY,
+        )
+        lifecycle.bind("first", 1)
+        repeat(100) { index ->
+            lifecycle.prepareStandby("next-$index", "token-$index")
+            val standby = lifecycle.preparedEngine as FakeReusablePlayerEngine
+            assertFalse(standby.events.takeLast(5).contains("playWhenReady:true"))
+            assertEquals(null, lifecycle.promotePrepared("stale", index + 2L))
+            val old = lifecycle.currentEngine as FakeReusablePlayerEngine
+            val promoted = lifecycle.promotePrepared("token-$index", index + 2L)
+            assertEquals(standby, promoted)
+            assertEquals(listOf("pause", "clear"), old.events.takeLast(2))
+        }
+        assertEquals(2, engines.size)
+        assertEquals(2, lifecycle.instanceCount)
+        lifecycle.release()
+        assertEquals(0, lifecycle.instanceCount)
+        assertEquals(2, engines.count { it.events.last() == "release" })
+    }
+
     @Test
     fun stableViewBindingNeverLeavesTwoViewsAttachedAndIgnoresRecomposition() {
         val binding = StablePlayerViewBinding<FakePlayerView, String>(
@@ -346,6 +372,59 @@ class ReusablePlayerLifecycleTest {
         assertEquals(emptyList<String>(), engine.events)
     }
 
+    @Test
+    fun failedStandbyPreparationCannotPromoteAndReleasesPartialMedia() {
+        val engine = FakeReusablePlayerEngine().apply { failPrepare = true }
+        val lifecycle = lifecycle(engine)
+        org.junit.Assert.assertThrows(IllegalStateException::class.java) {
+            lifecycle.prepareStandby("partial", "next")
+        }
+        assertEquals(false, lifecycle.hasPreparedStandby("next"))
+        assertEquals(null, lifecycle.promotePrepared("next", 1L))
+        lifecycle.releaseStandby()
+        lifecycle.releaseStandby()
+        assertEquals(1, engine.events.count { it == "clear" })
+        assertEquals(1, engine.events.count { it == "release" })
+        assertEquals(0, lifecycle.instanceCount)
+    }
+
+    @Test
+    fun standbyTeardownFailureStillReleasesEngineAndInvalidatesOwnership() {
+        val engine = FakeReusablePlayerEngine()
+        val lifecycle = lifecycle(engine)
+        lifecycle.prepareStandby("next", "next")
+        engine.failClear = true
+        org.junit.Assert.assertThrows(IllegalStateException::class.java) {
+            lifecycle.releaseStandby()
+        }
+        assertEquals(null, lifecycle.preparedEngine)
+        assertEquals(0, lifecycle.instanceCount)
+        assertEquals(false, lifecycle.hasPreparedStandby("next"))
+        assertEquals(1, engine.events.count { it == "release" })
+        lifecycle.releaseStandby()
+    }
+
+    @Test
+    fun actualGesturePausePreservesPreparedTokenUntilSettlement() {
+        val engines = mutableListOf<FakeReusablePlayerEngine>()
+        val lifecycle = ReusablePlayerLifecycle(
+            factory = { FakeReusablePlayerEngine().also(engines::add) },
+            startOrder = PlaybackStartOrder.PREPARE_THEN_PLAY,
+        )
+        lifecycle.bind("current")
+        repeat(100) { index ->
+            lifecycle.prepareStandby("next-$index", "token-$index")
+            val prepared = lifecycle.preparedEngine
+            lifecycle.pauseForPageTransition()
+            assertTrue(lifecycle.hasPreparedStandby("token-$index"))
+            assertEquals(prepared, lifecycle.promotePrepared("token-$index", index + 2L))
+            lifecycle.clearStandby()
+        }
+        assertEquals(2, engines.size)
+        lifecycle.release()
+        assertEquals(0, lifecycle.instanceCount)
+    }
+
     private fun lifecycle(
         engine: FakeReusablePlayerEngine,
     ): ReusablePlayerLifecycle<String> = ReusablePlayerLifecycle(
@@ -373,6 +452,8 @@ class ReusablePlayerLifecycleTest {
         override var playbackSpeed: Float = VideoPlaybackSpeeds.NORMAL
             private set
         var rejectedSpeed: Float? = null
+        var failPrepare = false
+        var failClear = false
 
         fun forcePlaybackSpeed(speed: Float) {
             playbackSpeed = speed
@@ -384,6 +465,7 @@ class ReusablePlayerLifecycleTest {
 
         override fun prepare() {
             events += "prepare"
+            if (failPrepare) error("fixture prepare failed")
         }
 
         override fun setPlayWhenReady(playWhenReady: Boolean) {
@@ -402,6 +484,7 @@ class ReusablePlayerLifecycleTest {
 
         override fun clearMedia() {
             events += "clear"
+            if (failClear) error("fixture clear failed")
         }
 
         override fun release() {

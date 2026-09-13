@@ -9,10 +9,12 @@ import android.net.Uri
 import android.view.ViewGroup
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.animateDpAsState
@@ -50,7 +52,9 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.verticalScroll
@@ -98,6 +102,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsPropertyKey
 import androidx.compose.ui.semantics.SemanticsPropertyReceiver
@@ -113,6 +118,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -120,6 +126,7 @@ import androidx.compose.ui.zIndex
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.view.WindowCompat
@@ -128,9 +135,11 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.PlayerView
+import com.qixuan.channelvideoflow.R
 import com.qixuan.channelvideoflow.model.video.IndexedVideo
 import com.qixuan.channelvideoflow.model.video.VideoFeedOrder
 import com.qixuan.channelvideoflow.model.video.VideoFilter
+import com.qixuan.channelvideoflow.model.video.DEFAULT_VIDEO_FEED_ORDER
 import com.qixuan.channelvideoflow.model.video.VideoKey
 import com.qixuan.channelvideoflow.player.VideoPlaybackFailure
 import com.qixuan.channelvideoflow.player.VideoPlaybackState
@@ -139,10 +148,12 @@ import com.qixuan.channelvideoflow.ui.theme.ChannelVideoFlowTokens
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlin.math.roundToLong
 
@@ -150,6 +161,7 @@ internal object VideoFeedTestTags {
     const val Loading = "video-feed-loading"
     const val Empty = "video-feed-empty"
     const val EmptyAction = "video-feed-empty-action"
+    const val FeedError = "video-feed-error"
     const val Retry = "video-feed-retry"
     const val TapSurface = "video-feed-tap-surface"
     const val PausedOverlay = "video-feed-paused-overlay"
@@ -166,6 +178,7 @@ internal object VideoFeedTestTags {
     const val SwipeHint = "video-feed-swipe-hint"
     const val TemporarySpeed = "video-feed-temporary-speed"
     const val DetailsExpand = "video-feed-details-expand"
+    const val MetadataSummary = "video-feed-metadata-summary"
     const val DetailsSheet = "video-feed-details-sheet"
     const val DetailsContent = "video-feed-details-content"
     const val DetailsClose = "video-feed-details-close"
@@ -197,6 +210,8 @@ fun VideoPlaybackRoute(
     onBack: () -> Unit,
     onLogout: () -> Unit,
     initialFilter: VideoFilter? = null,
+    initialOrder: VideoFeedOrder = DEFAULT_VIDEO_FEED_ORDER,
+    onOrderPersisted: (VideoFeedOrder) -> Unit = {},
     viewModel: VideoPlaybackViewModel = hiltViewModel(),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -204,11 +219,12 @@ fun VideoPlaybackRoute(
     val context = LocalContext.current
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
 
-    LaunchedEffect(viewModel, initialFilter) {
-        initialFilter?.let(viewModel::setFilter)
+    LaunchedEffect(viewModel, initialFilter, initialOrder) {
+        initialFilter?.let { filter -> viewModel.setFeedSource(filter, initialOrder) }
     }
 
     FullscreenSystemUiEffect(isFullscreen = isFullscreen)
+    KeepScreenOnEffect(keepScreenOn = shouldKeepScreenOn(uiState))
     DisposableEffect(lifecycleOwner, viewModel) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -241,12 +257,17 @@ fun VideoPlaybackRoute(
             onLogout()
         },
         onRetry = viewModel::retry,
+        onConfirmOriginalPlayback = viewModel::confirmOriginalPlayback,
+        onFeedRetry = viewModel::retryFeedObservation,
         onTogglePause = viewModel::togglePause,
         onTemporaryPlaybackSpeedChanged = viewModel::setTemporaryPlaybackSpeed,
         onSeek = viewModel::seekTo,
         onToggleMute = viewModel::toggleMute,
         onOriginalMessage = viewModel::requestOriginalMessageLink,
-        onOrderChanged = viewModel::setOrder,
+        onOrderChanged = { order ->
+            viewModel.setOrder(order)
+            onOrderPersisted(order)
+        },
         onPageUnstable = viewModel::onPageUnstable,
         onPageTargeted = viewModel::onPageTargeted,
         onPageSettled = viewModel::onPageSettled,
@@ -256,6 +277,7 @@ fun VideoPlaybackRoute(
         onDetachPlayer = viewModel::detachPlayer,
         isFullscreen = isFullscreen,
         onFullscreenChanged = { isFullscreen = it },
+        autoHideControls = true,
     )
 }
 
@@ -267,6 +289,7 @@ internal fun VideoPlaybackScreen(
     onBack: () -> Unit,
     onLogout: () -> Unit,
     onRetry: () -> Unit,
+    onConfirmOriginalPlayback: (VideoKey, Int) -> Unit = { _, _ -> },
     onTogglePause: () -> Unit,
     onTemporaryPlaybackSpeedChanged: (Boolean) -> Unit = {},
     onSeek: (Long) -> Unit,
@@ -281,19 +304,50 @@ internal fun VideoPlaybackScreen(
     onAttachPlayer: (PlayerView) -> Unit,
     onDetachPlayer: (PlayerView) -> Unit = {},
     onPagerComposed: () -> Unit = {},
+    /** Observation hook for tests: receives the feed pager state once it exists. */
+    onPagerState: ((PagerState) -> Unit)? = null,
     isFullscreen: Boolean = false,
     onFullscreenChanged: (Boolean) -> Unit = {},
+    onFeedRetry: () -> Unit = {},
+    autoHideControls: Boolean = false,
 ) {
     var detailVideoKey by remember { mutableStateOf<VideoKey?>(null) }
+    var expandedMetadataKey by remember { mutableStateOf<VideoKey?>(null) }
+    var currentVideoKey by remember { mutableStateOf<VideoKey?>(null) }
+    var controlsVisible by rememberSaveable { mutableStateOf(true) }
     val detailItem = detailVideoKey?.let { key ->
         (uiState.items + uiState.upcomingItems).firstOrNull { item -> item.video.key == key }
     }
     val activeDetailItem = detailItem?.takeIf {
         uiState.phase == VideoFeedPhase.CONTENT && !isFullscreen
     }
+    // The description is collapsed by default so it cannot cover the frame; an explicitly
+    // expanded panel belongs to one video only and suspends the auto-hide timer.
+    val metadataExpanded = expandedMetadataKey != null && expandedMetadataKey == currentVideoKey
+    val autoHideEligible = autoHideControls &&
+        uiState.phase == VideoFeedPhase.CONTENT &&
+        uiState.player.isPlaying &&
+        activeDetailItem == null &&
+        !metadataExpanded &&
+        !isFullscreen
+
+    LaunchedEffect(
+        uiState.queueGeneration,
+        uiState.player.playbackState.videoKeyOrNull(),
+        autoHideEligible,
+        controlsVisible,
+    ) {
+        if (!autoHideEligible) {
+            controlsVisible = true
+        } else if (controlsVisible) {
+            delay(CONTROL_AUTO_HIDE_MILLIS)
+            controlsVisible = false
+        }
+    }
 
     LaunchedEffect(uiState.queueGeneration) {
         detailVideoKey = null
+        expandedMetadataKey = null
     }
     LaunchedEffect(uiState.phase, detailItem, isFullscreen) {
         if (
@@ -334,41 +388,89 @@ internal fun VideoPlaybackScreen(
             } else when (uiState.phase) {
                 VideoFeedPhase.LOADING -> ImmersiveLoadingState()
                 VideoFeedPhase.EMPTY -> ImmersiveEmptyState(onBack = onBack)
+                VideoFeedPhase.ERROR -> ImmersiveFeedFailureState(onRetry = onFeedRetry)
                 VideoFeedPhase.CONTENT -> FeedPager(
                     uiState = uiState,
                     playbackProgress = playbackProgress,
                     onRetry = onRetry,
+                    onConfirmOriginalPlayback = onConfirmOriginalPlayback,
                     onTogglePause = onTogglePause,
                     onTemporaryPlaybackSpeedChanged = onTemporaryPlaybackSpeedChanged,
                     onSeek = onSeek,
                     onToggleMute = onToggleMute,
                     onOriginalMessage = onOriginalMessage,
-                    onPageUnstable = onPageUnstable,
+                    onPageUnstable = {
+                        controlsVisible = true
+                        onPageUnstable()
+                    },
                     onPageTargeted = onPageTargeted,
-                    onPageSettled = onPageSettled,
+                    onPageSettled = { pagerPage, logicalPage ->
+                        controlsVisible = true
+                        onPageSettled(pagerPage, logicalPage)
+                    },
                     onPagerPointerDown = onPagerPointerDown,
                     onPagerPointerReleased = onPagerPointerReleased,
                     onAttachPlayer = onAttachPlayer,
                     onDetachPlayer = onDetachPlayer,
                     onPagerComposed = onPagerComposed,
+                    onPagerState = onPagerState,
                     isFullscreen = isFullscreen,
                     onFullscreenChanged = onFullscreenChanged,
                     detailsVisible = activeDetailItem != null,
+                    controlsVisible = controlsVisible,
+                    onControlsInteraction = { controlsVisible = true },
                     onShowDetails = { key -> detailVideoKey = key },
+                    metadataExpanded = metadataExpanded,
+                    onToggleMetadata = {
+                        expandedMetadataKey = if (metadataExpanded) null else currentVideoKey
+                    },
                     onCurrentVideoKeyChanged = { currentKey ->
+                        currentVideoKey = currentKey
                         if (detailVideoKey != null && detailVideoKey != currentKey) {
                             detailVideoKey = null
+                        }
+                        if (expandedMetadataKey != null && expandedMetadataKey != currentKey) {
+                            expandedMetadataKey = null
                         }
                     },
                 )
             }
+            if (uiState.phase == VideoFeedPhase.CONTENT && uiState.feedFailure != null) {
+                TextButton(
+                    onClick = onFeedRetry,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
+                        .padding(top = 64.dp)
+                        .background(
+                            color = Color.Black.copy(alpha = 0.72f),
+                            shape = ChannelVideoFlowTokens.Shapes.pill,
+                        )
+                        .testTag(VideoFeedTestTags.FeedError),
+                ) {
+                    Text(
+                        text = stringResource(R.string.video_feed_database_error_retry),
+                        color = Color.White,
+                    )
+                }
+            }
             if (!isFullscreen) {
-                FeedTopBar(
-                    order = uiState.order,
-                    onBack = onBack,
-                    onLogout = onLogout,
-                    onOrderChanged = onOrderChanged,
-                )
+                AnimatedVisibility(
+                    visible = controlsVisible || uiState.phase != VideoFeedPhase.CONTENT,
+                    modifier = Modifier.align(Alignment.TopCenter),
+                    enter = fadeIn(tween(CONTROL_VISIBILITY_ANIMATION_MILLIS)),
+                    exit = fadeOut(tween(CONTROL_VISIBILITY_ANIMATION_MILLIS)),
+                    label = "feed top controls",
+                ) {
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        FeedTopBar(
+                            order = uiState.order,
+                            onBack = onBack,
+                            onLogout = onLogout,
+                            onOrderChanged = onOrderChanged,
+                        )
+                    }
+                }
             }
         }
 
@@ -388,6 +490,8 @@ private fun FeedTopBar(
     onLogout: () -> Unit,
     onOrderChanged: (VideoFeedOrder) -> Unit,
 ) {
+    val backLabel = stringResource(R.string.video_back_channels)
+    val logoutLabel = stringResource(R.string.video_logout)
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -417,7 +521,7 @@ private fun FeedTopBar(
             onClick = onBack,
             modifier = Modifier.align(Alignment.CenterStart),
         ) {
-            FeedIcon(FeedIconType.BACK, "返回频道")
+            FeedIcon(FeedIconType.BACK, backLabel)
         }
         Row(
             modifier = Modifier.align(Alignment.Center),
@@ -425,13 +529,13 @@ private fun FeedTopBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             FeedOrderTab(
-                text = "最新",
+                text = stringResource(R.string.video_order_latest),
                 selected = order == VideoFeedOrder.LATEST,
                 testTag = VideoFeedTestTags.LatestOrder,
                 onClick = { onOrderChanged(VideoFeedOrder.LATEST) },
             )
             FeedOrderTab(
-                text = "随机",
+                text = stringResource(R.string.video_order_random),
                 selected = order == VideoFeedOrder.RANDOM,
                 testTag = VideoFeedTestTags.RandomOrder,
                 onClick = { onOrderChanged(VideoFeedOrder.RANDOM) },
@@ -443,7 +547,7 @@ private fun FeedTopBar(
                 .align(Alignment.CenterEnd)
                 .testTag(VideoFeedTestTags.Logout),
         ) {
-            FeedIcon(FeedIconType.LOGOUT, "退出登录")
+            FeedIcon(FeedIconType.LOGOUT, logoutLabel)
         }
     }
 }
@@ -504,6 +608,7 @@ private fun FeedPager(
     uiState: VideoPlaybackUiState,
     playbackProgress: StateFlow<VideoPlaybackProgressUiState>?,
     onRetry: () -> Unit,
+    onConfirmOriginalPlayback: (VideoKey, Int) -> Unit,
     onTogglePause: () -> Unit,
     onTemporaryPlaybackSpeedChanged: (Boolean) -> Unit,
     onSeek: (Long) -> Unit,
@@ -517,43 +622,52 @@ private fun FeedPager(
     onAttachPlayer: (PlayerView) -> Unit,
     onDetachPlayer: (PlayerView) -> Unit,
     onPagerComposed: () -> Unit,
+    onPagerState: ((PagerState) -> Unit)?,
     isFullscreen: Boolean,
     onFullscreenChanged: (Boolean) -> Unit,
     detailsVisible: Boolean,
+    controlsVisible: Boolean,
+    onControlsInteraction: () -> Unit,
     onShowDetails: (VideoKey) -> Unit,
+    metadataExpanded: Boolean,
+    onToggleMetadata: () -> Unit,
     onCurrentVideoKeyChanged: (VideoKey?) -> Unit,
 ) {
     SideEffect(onPagerComposed)
     val context = LocalContext.current
+    val currentKeys = uiState.logicalFeedKeys()
     val pagerState = rememberPagerState(
         pageCount = {
-            if (uiState.order == VideoFeedOrder.RANDOM) RANDOM_PAGER_PAGE_COUNT else uiState.items.size
+            if (uiState.order == VideoFeedOrder.RANDOM) RANDOM_PAGER_PAGE_COUNT else currentKeys.size
         },
     )
+    if (onPagerState != null) {
+        SideEffect { onPagerState(pagerState) }
+    }
     LaunchedEffect(uiState.queueGeneration) {
-        if (uiState.items.isNotEmpty()) {
+        if (currentKeys.isNotEmpty()) {
             pagerState.scrollToPage(
                 if (uiState.order == VideoFeedOrder.RANDOM) {
-                    randomPagerStart(uiState.items.size)
+                    randomPagerStart(currentKeys.size)
                 } else {
                     0
                 },
             )
         }
     }
-    LaunchedEffect(uiState.items.size) {
+    LaunchedEffect(currentKeys.size) {
         if (
             uiState.order == VideoFeedOrder.LATEST &&
-            pagerState.currentPage >= uiState.items.size &&
-            uiState.items.isNotEmpty()
+            pagerState.currentPage >= currentKeys.size &&
+            currentKeys.isNotEmpty()
         ) {
-            pagerState.scrollToPage(uiState.items.lastIndex)
+            pagerState.scrollToPage(currentKeys.lastIndex)
         }
     }
     LaunchedEffect(
         pagerState,
-        uiState.items.size,
-        uiState.upcomingItems,
+        uiState.feedGeneration,
+        uiState.hydrationGeneration,
         uiState.randomRoundStartPagerPage,
     ) {
         snapshotFlow {
@@ -571,18 +685,19 @@ private fun FeedPager(
                         currentPage = signal.currentPage,
                         predictedTargetPage = signal.targetPage,
                     )
-                    resolvePagerItem(uiState, committedTargetPage)?.let { target ->
+                    resolvePagerSlot(uiState, committedTargetPage)?.let { target ->
                         onPageTargeted(committedTargetPage, target.logicalPage)
                     }
                 } else {
-                    resolvePagerItem(uiState, signal.settledPage)?.let { settled ->
+                    resolvePagerSlot(uiState, signal.settledPage)?.let { settled ->
                         onPageSettled(signal.settledPage, settled.logicalPage)
                     }
                 }
             }
     }
 
-    val currentItem = resolvePagerItem(uiState, pagerState.currentPage)?.item
+    val currentSlot = resolvePagerSlot(uiState, pagerState.currentPage)
+    val currentItem = currentSlot?.item
     val pagerInteractionEnabled =
         !isFullscreen &&
             !detailsVisible
@@ -591,7 +706,75 @@ private fun FeedPager(
     }
     val currentPointerDown = rememberUpdatedState(onPagerPointerDown)
     val currentPointerReleased = rememberUpdatedState(onPagerPointerReleased)
-    ProtectedContentWindowEffect(isProtected = currentItem?.video?.canBeSaved == false)
+    var pointerHeld by remember { mutableStateOf(false) }
+    val autoAdvancePointerDown = rememberUpdatedState<(Long) -> Unit>({ time ->
+        pointerHeld = true
+        currentPointerDown.value(time)
+    })
+    val autoAdvancePointerReleased = rememberUpdatedState<(Long) -> Unit>({ time ->
+        pointerHeld = false
+        currentPointerReleased.value(time)
+    })
+    val latestUiState by rememberUpdatedState(uiState)
+    val latestDetailsVisible by rememberUpdatedState(detailsVisible)
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val endedKey = (uiState.player.playbackState as? VideoPlaybackState.Ready)
+        ?.video?.key?.takeIf { uiState.player.hasEnded }
+    // One logical advance per completion. Recomposition and progress updates cannot enqueue
+    // more pages, and the normal pager observer stays the sole owner of preparation and
+    // binding. The target page is anchored when the completion is observed so that a
+    // lifecycle interruption mid-flight can finish the same transition instead of skipping a
+    // page; a cancelled animateScrollToPage leaves the pager snapped to no page (device probe),
+    // so the advance may only be consumed after it completes, and any user gesture on the pager
+    // consumes it for good.
+    LaunchedEffect(endedKey, uiState.queueGeneration, lifecycle) {
+        if (endedKey == null) return@LaunchedEffect
+        var consumed = false
+        var targetPage: Int? = null
+        var resumeAfterInterruption = false
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            if (consumed) return@repeatOnLifecycle
+            if (!resumeAfterInterruption) {
+                snapshotFlow {
+                    !latestDetailsVisible && !pointerHeld &&
+                        !pagerState.isScrollInProgress && !latestUiState.player.isPaused &&
+                        resolvePagerSlot(latestUiState, pagerState.settledPage)?.key == endedKey
+                }.first { it }
+                targetPage = pagerState.settledPage + 1
+            }
+            val nextPage = requireNotNull(targetPage)
+            if (nextPage >= pagerState.pageCount ||
+                resolvePagerSlot(latestUiState, nextPage) == null
+            ) {
+                consumed = true
+                return@repeatOnLifecycle
+            }
+            resumeAfterInterruption = false
+            try {
+                pagerState.animateScrollToPage(nextPage, animationSpec = tween(300))
+                consumed = true
+            } catch (cancelled: CancellationException) {
+                // A gesture or a queue change while resumed keeps the user in charge; a
+                // lifecycle interruption lets the next RESUMED pass finish the advance.
+                if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                    consumed = true
+                } else {
+                    resumeAfterInterruption = true
+                }
+                throw cancelled
+            }
+        }
+    }
+    val boundVideoProtected = when (val state = uiState.player.playbackState) {
+        VideoPlaybackState.Idle -> false
+        is VideoPlaybackState.Loading -> !state.video.canBeSaved
+        is VideoPlaybackState.Ready -> !state.video.canBeSaved
+        is VideoPlaybackState.Unsupported -> !state.video.canBeSaved
+        is VideoPlaybackState.Failed -> !state.video.canBeSaved
+    }
+    ProtectedContentWindowEffect(
+        isProtected = currentItem?.video?.canBeSaved == false || boundVideoProtected,
+    )
     if (uiState.items.any { item -> item.video.supportsStreaming }) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
@@ -620,40 +803,50 @@ private fun FeedPager(
                     Modifier
                 } else {
                     Modifier.observePagerPointerLifecycle(
-                        onPointerDown = currentPointerDown,
-                        onPointerReleased = currentPointerReleased,
+                        onPointerDown = autoAdvancePointerDown,
+                        onPointerReleased = autoAdvancePointerReleased,
                     )
                 },
             )
             .testTag(VideoFeedTestTags.Pager),
         userScrollEnabled = pagerInteractionEnabled,
         key = { page ->
-            val resolved = requireNotNull(resolvePagerItem(uiState, page))
+            val resolved = requireNotNull(resolvePagerSlot(uiState, page))
             pagerItemKey(
                 pagerPage = page,
                 order = uiState.order,
-                videoKey = resolved.item.video.key,
+                videoKey = resolved.key,
             )
         },
     ) { page ->
-        val resolved = requireNotNull(resolvePagerItem(uiState, page))
-        FeedPage(
-            item = resolved.item,
-            isCurrentPage = page == pagerState.currentPage,
-            isPageScrolling = pagerState.isScrollInProgress,
-            isFullscreen = isFullscreen,
-            uiState = uiState,
-            playbackProgress = playbackProgress,
-            onRetry = onRetry,
-            onTogglePause = onTogglePause,
-            onTemporaryPlaybackSpeedChanged = onTemporaryPlaybackSpeedChanged,
-            onSeek = onSeek,
-            onToggleMute = onToggleMute,
-            onOriginalMessage = onOriginalMessage,
-            onFullscreenChanged = onFullscreenChanged,
-            detailsVisible = detailsVisible,
-            onShowDetails = onShowDetails,
-        )
+        val resolved = requireNotNull(resolvePagerSlot(uiState, page))
+        val item = resolved.item
+        if (item == null) {
+            ImmersiveLoadingState()
+        } else {
+            FeedPage(
+                item = item,
+                isCurrentPage = page == pagerState.currentPage,
+                isPageScrolling = pagerState.isScrollInProgress,
+                isFullscreen = isFullscreen,
+                uiState = uiState,
+                playbackProgress = playbackProgress,
+                onRetry = onRetry,
+                    onConfirmOriginalPlayback = onConfirmOriginalPlayback,
+                onTogglePause = onTogglePause,
+                onTemporaryPlaybackSpeedChanged = onTemporaryPlaybackSpeedChanged,
+                onSeek = onSeek,
+                onToggleMute = onToggleMute,
+                onOriginalMessage = onOriginalMessage,
+                onFullscreenChanged = onFullscreenChanged,
+                detailsVisible = detailsVisible,
+                controlsVisible = controlsVisible,
+                onControlsInteraction = onControlsInteraction,
+                onShowDetails = onShowDetails,
+                metadataExpanded = metadataExpanded,
+                onToggleMetadata = onToggleMetadata,
+            )
+        }
     }
 }
 
@@ -689,30 +882,56 @@ internal data class ResolvedPagerItem(
     val logicalPage: Int,
 )
 
-internal fun resolvePagerItem(
+private data class ResolvedPagerSlot(
+    val key: VideoKey,
+    val item: FeedVideoItem?,
+    val logicalPage: Int,
+)
+
+private fun VideoPlaybackUiState.logicalFeedKeys(): List<VideoKey> =
+    feedKeys.ifEmpty { items.map { item -> item.video.key } }
+
+private fun VideoPlaybackUiState.logicalUpcomingKeys(): List<VideoKey> =
+    upcomingKeys.ifEmpty { upcomingItems.map { item -> item.video.key } }
+
+private fun resolvePagerSlot(
     uiState: VideoPlaybackUiState,
     pagerPage: Int,
-): ResolvedPagerItem? {
-    val current = uiState.items
+): ResolvedPagerSlot? {
+    val current = uiState.logicalFeedKeys()
     if (current.isEmpty()) return null
+    val hydrated = (uiState.items + uiState.upcomingItems).associateBy { item -> item.video.key }
     if (uiState.order != VideoFeedOrder.RANDOM) {
-        return current.getOrNull(pagerPage)?.let { ResolvedPagerItem(it, pagerPage) }
+        val key = current.getOrNull(pagerPage) ?: return null
+        return ResolvedPagerSlot(key, hydrated[key], pagerPage)
     }
     val roundStart = uiState.randomRoundStartPagerPage
     if (roundStart == null) {
         val index = Math.floorMod(pagerPage, current.size)
-        return ResolvedPagerItem(current[index], index)
+        val key = current[index]
+        return ResolvedPagerSlot(key, hydrated[key], index)
     }
     val offset = pagerPage - roundStart
-    if (offset < 0 || uiState.upcomingItems.isEmpty()) {
+    val upcoming = uiState.logicalUpcomingKeys()
+    if (offset < 0 || upcoming.isEmpty()) {
         val index = Math.floorMod(offset, current.size)
-        return ResolvedPagerItem(current[index], index)
+        val key = current[index]
+        return ResolvedPagerSlot(key, hydrated[key], index)
     }
     if (offset < current.size) {
-        return ResolvedPagerItem(current[offset], offset)
+        val key = current[offset]
+        return ResolvedPagerSlot(key, hydrated[key], offset)
     }
-    val upcomingIndex = Math.floorMod(offset - current.size, uiState.upcomingItems.size)
-    return ResolvedPagerItem(uiState.upcomingItems[upcomingIndex], upcomingIndex)
+    val upcomingIndex = Math.floorMod(offset - current.size, upcoming.size)
+    val key = upcoming[upcomingIndex]
+    return ResolvedPagerSlot(key, hydrated[key], upcomingIndex)
+}
+
+internal fun resolvePagerItem(
+    uiState: VideoPlaybackUiState,
+    pagerPage: Int,
+): ResolvedPagerItem? = resolvePagerSlot(uiState, pagerPage)?.let { resolved ->
+    resolved.item?.let { item -> ResolvedPagerItem(item, resolved.logicalPage) }
 }
 
 private sealed interface FeedPagePresentation {
@@ -753,11 +972,15 @@ private fun Modifier.observePagerPointerLifecycle(
             pass = PointerEventPass.Initial,
         )
         onPointerDown.value(monotonicTimeMillis())
-        do {
-            val event = awaitPointerEvent(PointerEventPass.Initial)
-            val anyPressed = event.changes.any { change -> change.pressed }
-        } while (anyPressed)
-        onPointerReleased.value(monotonicTimeMillis())
+        try {
+            do {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val anyPressed = event.changes.any { change -> change.pressed }
+            } while (anyPressed)
+        } finally {
+            // Fullscreen/details can remove this modifier before an UP event arrives.
+            onPointerReleased.value(monotonicTimeMillis())
+        }
     }
 }
 
@@ -770,6 +993,7 @@ private fun FeedPage(
     uiState: VideoPlaybackUiState,
     playbackProgress: StateFlow<VideoPlaybackProgressUiState>?,
     onRetry: () -> Unit,
+    onConfirmOriginalPlayback: (VideoKey, Int) -> Unit,
     onTogglePause: () -> Unit,
     onTemporaryPlaybackSpeedChanged: (Boolean) -> Unit,
     onSeek: (Long) -> Unit,
@@ -777,7 +1001,11 @@ private fun FeedPage(
     onOriginalMessage: () -> Unit,
     onFullscreenChanged: (Boolean) -> Unit,
     detailsVisible: Boolean,
+    controlsVisible: Boolean,
+    onControlsInteraction: () -> Unit,
     onShowDetails: (VideoKey) -> Unit,
+    metadataExpanded: Boolean,
+    onToggleMetadata: () -> Unit,
 ) {
     Box(
         modifier = Modifier
@@ -787,6 +1015,30 @@ private fun FeedPage(
             ),
     ) {
         if (!isCurrentPage) return@Box
+
+        val pending = uiState.originalPlaybackAwaitingConfirmation?.takeIf { it.key == item.video.key }
+        if (pending != null) {
+            Column(
+                modifier = Modifier.align(Alignment.Center).fillMaxWidth().padding(32.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                Text(stringResource(R.string.video_original_confirmation_title), color = Color.White)
+                Text(
+                    stringResource(R.string.video_original_confirmation_body,
+                        com.qixuan.channelvideoflow.feature.settings.formatByteSize(pending.playbackFileSize ?: 0L)),
+                    color = Color.White,
+                )
+                TextButton(
+                    onClick = { onConfirmOriginalPlayback(pending.key, pending.playbackFileId) },
+                    modifier = Modifier.testTag("video-original-confirm"),
+                ) {
+                    Text(stringResource(R.string.video_original_confirmation_play))
+                }
+                Text(stringResource(R.string.video_original_confirmation_skip), color = Color.White)
+            }
+            return@Box
+        }
 
         val presentation = feedPagePresentation(item, uiState.player)
         when (presentation) {
@@ -821,7 +1073,11 @@ private fun FeedPage(
                         onOriginalMessage = onOriginalMessage,
                         onFullscreenChanged = onFullscreenChanged,
                         detailsVisible = detailsVisible,
+                        controlsVisible = controlsVisible,
+                        onControlsInteraction = onControlsInteraction,
                         onShowDetails = onShowDetails,
+                        metadataExpanded = metadataExpanded,
+                        onToggleMetadata = onToggleMetadata,
                     )
                 }
                 ImmersiveVideoLoadingState(
@@ -847,10 +1103,18 @@ private fun BoxScope.FeedContentOverlay(
     onOriginalMessage: () -> Unit,
     onFullscreenChanged: (Boolean) -> Unit,
     detailsVisible: Boolean,
+    controlsVisible: Boolean,
+    onControlsInteraction: () -> Unit,
     onShowDetails: (VideoKey) -> Unit,
+    metadataExpanded: Boolean,
+    onToggleMetadata: () -> Unit,
 ) {
     var isScrubbing by remember(item.video.key) { mutableStateOf(false) }
     var isMetadataDimmed by remember(item.video.key) { mutableStateOf(false) }
+    val pauseLabel = stringResource(R.string.video_pause)
+    val metadataDimmedDescription = stringResource(R.string.video_metadata_dimmed)
+    val metadataVisibleDescription = stringResource(R.string.video_metadata_visible)
+    val showControlsLabel = stringResource(R.string.video_show_controls)
     val isInteracting = isPageScrolling || isScrubbing
     LaunchedEffect(item.video.key, isInteracting) {
         if (isInteracting) {
@@ -874,12 +1138,12 @@ private fun BoxScope.FeedContentOverlay(
     val currentTogglePause = rememberUpdatedState(onTogglePause)
     val currentTemporarySpeedChanged = rememberUpdatedState(onTemporaryPlaybackSpeedChanged)
 
-    if (!isFullscreen) {
+    if (!isFullscreen && controlsVisible) {
         Box(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .fillMaxHeight(0.46f)
+                .fillMaxHeight(BOTTOM_SCRIM_HEIGHT_FRACTION)
                 .graphicsLayer { alpha = metadataAlpha }
                 .background(
                     Brush.verticalGradient(
@@ -896,6 +1160,8 @@ private fun BoxScope.FeedContentOverlay(
             .then(
                 if (detailsVisible) {
                     Modifier
+                } else if (!controlsVisible) {
+                    Modifier.clickable(role = Role.Button, onClick = onControlsInteraction)
                 } else {
                     Modifier.temporarySpeedTapGesture(
                         onTap = currentTogglePause,
@@ -906,11 +1172,20 @@ private fun BoxScope.FeedContentOverlay(
             .then(
                 if (uiState.player.isPaused || detailsVisible) {
                     Modifier.clearAndSetSemantics { }
+                } else if (!controlsVisible) {
+                    Modifier.semantics {
+                        role = Role.Button
+                        contentDescription = showControlsLabel
+                        onClick(label = showControlsLabel) {
+                            onControlsInteraction()
+                            true
+                        }
+                    }
                 } else {
                     Modifier.semantics {
                         role = Role.Button
-                        contentDescription = "暂停视频"
-                        onClick(label = "暂停视频") {
+                        contentDescription = pauseLabel
+                        onClick(label = pauseLabel) {
                             currentTogglePause.value()
                             true
                         }
@@ -965,7 +1240,7 @@ private fun BoxScope.FeedContentOverlay(
     ) {
         TemporarySpeedIndicator(enabled = temporarySpeedActive)
     }
-    if (uiState.showSwipeHint && !isFullscreen) {
+    if (uiState.showSwipeHint && !isFullscreen && controlsVisible) {
         SwipeHint(
             modifier = Modifier
                 .align(Alignment.Center)
@@ -973,31 +1248,19 @@ private fun BoxScope.FeedContentOverlay(
         )
     }
     if (!isFullscreen) {
-        FeedMetadata(
-            item = item,
-            linkState = uiState.originalMessageLink,
-            onShowDetails = onShowDetails,
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .fillMaxWidth()
-                .windowInsetsPadding(
-                    WindowInsets.safeContent.only(
-                        WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom,
-                    ),
-                )
-                .padding(start = 16.dp, end = 92.dp, bottom = 36.dp)
-                .graphicsLayer { alpha = metadataAlpha }
-                .semantics {
-                    stateDescription = if (isMetadataDimmed) "简介已淡化" else "简介可见"
-                }
-                .testTag(VideoFeedTestTags.Metadata),
-        )
-        FeedActionRail(
+        if (controlsVisible) {
+            FeedActionRail(
             isMuted = uiState.player.isMuted,
             originalLinkLoading = uiState.originalMessageLink is OriginalMessageLinkUiState.Loading,
             interactionEnabled = !detailsVisible,
-            onToggleMute = onToggleMute,
-            onOriginalMessage = onOriginalMessage,
+            onToggleMute = {
+                onControlsInteraction()
+                onToggleMute()
+            },
+            onOriginalMessage = {
+                onControlsInteraction()
+                onOriginalMessage()
+            },
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .windowInsetsPadding(
@@ -1005,16 +1268,44 @@ private fun BoxScope.FeedContentOverlay(
                         WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom,
                     ),
                 )
-                .padding(end = 10.dp, bottom = 162.dp),
+                .padding(end = 10.dp, bottom = ACTION_RAIL_BOTTOM_OFFSET),
         )
-        if (item.video.isLandscapeVideo()) {
-            LandscapeFullscreenPrompt(
-                videoWidth = item.video.width,
-                videoHeight = item.video.height,
-                onClick = {
-                    if (!detailsVisible) onFullscreenChanged(true)
-                },
-            )
+            MetadataPanel(
+            item = item,
+            playbackState = uiState.player.playbackState,
+            linkState = uiState.originalMessageLink,
+            expanded = metadataExpanded,
+            onToggleExpanded = onToggleMetadata,
+            onShowDetails = onShowDetails,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .widthIn(max = VIDEO_METADATA_MAX_WIDTH)
+                .fillMaxWidth()
+                .windowInsetsPadding(
+                    WindowInsets.safeContent.only(
+                        WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom,
+                    ),
+                )
+                .padding(start = 16.dp, end = 92.dp, bottom = METADATA_BOTTOM_OFFSET)
+                .graphicsLayer { alpha = metadataAlpha }
+                .semantics {
+                    stateDescription = if (isMetadataDimmed) {
+                        metadataDimmedDescription
+                    } else {
+                        metadataVisibleDescription
+                    }
+                }
+                .testTag(VideoFeedTestTags.Metadata),
+        )
+            if (item.video.isLandscapeVideo()) {
+                LandscapeFullscreenPrompt(
+                    videoWidth = item.video.width,
+                    videoHeight = item.video.height,
+                    onClick = {
+                        if (!detailsVisible) onFullscreenChanged(true)
+                    },
+                )
+            }
         }
     } else {
         ExitFullscreenButton(
@@ -1024,21 +1315,23 @@ private fun BoxScope.FeedContentOverlay(
                 .padding(top = 12.dp, end = 12.dp),
         )
     }
-    PlaybackProgressState(
-        key = item.video.key,
-        playbackProgress = playbackProgress,
-        fallbackPlayer = uiState.player,
-        onSeek = if (detailsVisible) ({ _ -> }) else onSeek,
-        onScrubbingChanged = { isScrubbing = it },
-        modifier = Modifier
-            .align(Alignment.BottomCenter)
-            .windowInsetsPadding(
-                WindowInsets.safeContent.only(
-                    WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom,
-                ),
-            )
-            .padding(bottom = PROGRESS_BOTTOM_OFFSET),
-    )
+    if (controlsVisible) {
+        PlaybackProgressState(
+            key = item.video.key,
+            playbackProgress = playbackProgress,
+            fallbackPlayer = uiState.player,
+            onSeek = if (detailsVisible) ({ _ -> }) else onSeek,
+            onScrubbingChanged = { isScrubbing = it },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .windowInsetsPadding(
+                    WindowInsets.safeContent.only(
+                        WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom,
+                    ),
+                )
+                .padding(bottom = PROGRESS_BOTTOM_OFFSET),
+        )
+    }
 }
 
 private enum class BeforeLongPressResult {
@@ -1103,12 +1396,13 @@ private fun TemporarySpeedIndicator(
     enabled: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    val label = stringResource(R.string.video_temporary_speed)
     Box(
         modifier = modifier
             .then(
                 if (enabled) {
                     Modifier.semantics(mergeDescendants = true) {
-                        contentDescription = TEMPORARY_SPEED_LABEL
+                        contentDescription = label
                     }
                 } else {
                     Modifier.clearAndSetSemantics { }
@@ -1122,7 +1416,7 @@ private fun TemporarySpeedIndicator(
             .padding(horizontal = 16.dp, vertical = 9.dp),
     ) {
         Text(
-            text = TEMPORARY_SPEED_LABEL,
+            text = label,
             color = Color.White,
             fontSize = 15.sp,
             fontWeight = FontWeight.SemiBold,
@@ -1132,6 +1426,8 @@ private fun TemporarySpeedIndicator(
 
 @Composable
 private fun SwipeHint(modifier: Modifier = Modifier) {
+    val label = stringResource(R.string.video_swipe_hint)
+    val description = stringResource(R.string.video_swipe_hint_description)
     var animationStarted by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { animationStarted = true }
     val alpha by animateFloatAsState(
@@ -1149,7 +1445,7 @@ private fun SwipeHint(modifier: Modifier = Modifier) {
             .offset(y = verticalOffset)
             .graphicsLayer { this.alpha = alpha }
             .background(Color.Black.copy(alpha = 0.52f), RoundedCornerShape(20.dp))
-            .semantics { contentDescription = "上滑浏览下一条教学提示" }
+            .semantics { contentDescription = description }
             .testTag(VideoFeedTestTags.SwipeHint)
             .padding(horizontal = 18.dp, vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -1181,7 +1477,7 @@ private fun SwipeHint(modifier: Modifier = Modifier) {
             )
         }
         Text(
-            text = "上滑浏览下一条",
+            text = label,
             color = Color.White.copy(alpha = 0.94f),
             fontSize = 14.sp,
             fontWeight = FontWeight.Medium,
@@ -1217,15 +1513,175 @@ private fun PlaybackProgressState(
     )
 }
 
+/**
+ * Bottom description surface.
+ *
+ * The default state is a single compact row so the description never covers the frame; the full
+ * metadata block is only mounted after an explicit tap and collapses again as soon as the user
+ * moves to another video.
+ */
+@Composable
+private fun MetadataPanel(
+    item: FeedVideoItem,
+    playbackState: VideoPlaybackState,
+    linkState: OriginalMessageLinkUiState,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit,
+    onShowDetails: (VideoKey) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val panelFade = tween<Float>(METADATA_PANEL_ANIMATION_MILLIS)
+    val panelSize = tween<IntSize>(METADATA_PANEL_ANIMATION_MILLIS)
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        AnimatedVisibility(
+            visible = expanded,
+            enter = fadeIn(panelFade) +
+                expandVertically(
+                    animationSpec = panelSize,
+                    expandFrom = Alignment.Bottom,
+                ),
+            exit = fadeOut(panelFade) +
+                shrinkVertically(
+                    animationSpec = panelSize,
+                    shrinkTowards = Alignment.Bottom,
+                ),
+            label = "video metadata panel",
+        ) {
+            FeedMetadata(
+                item = item,
+                playbackState = playbackState,
+                linkState = linkState,
+                onShowDetails = onShowDetails,
+            )
+        }
+        MetadataSummaryBar(
+            channelTitle = item.channelTitle,
+            descriptionPreview = item.video.descriptionPreview(),
+            expanded = expanded,
+            onToggleExpanded = onToggleExpanded,
+        )
+    }
+}
+
+@Composable
+private fun MetadataSummaryBar(
+    channelTitle: String,
+    descriptionPreview: String,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit,
+) {
+    val actionLabel = stringResource(
+        if (expanded) R.string.video_metadata_collapse else R.string.video_metadata_expand,
+    )
+    val actionDescription = stringResource(
+        if (expanded) {
+            R.string.video_metadata_collapse_description
+        } else {
+            R.string.video_metadata_expand_description
+        },
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = ChannelVideoFlowTokens.Sizes.touchTarget)
+            .clip(METADATA_SUMMARY_SHAPE)
+            .background(Color.Black.copy(alpha = 0.58f))
+            .border(1.dp, Color.White.copy(alpha = 0.10f), METADATA_SUMMARY_SHAPE)
+            .clickable(role = Role.Button, onClick = onToggleExpanded)
+            .semantics { contentDescription = actionDescription }
+            .testTag(VideoFeedTestTags.MetadataSummary)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .width(3.dp)
+                .height(20.dp)
+                .background(FEED_ACCENT, RoundedCornerShape(2.dp)),
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = channelTitle,
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (descriptionPreview.isNotBlank()) {
+                Text(
+                    text = descriptionPreview,
+                    color = Color.White.copy(alpha = 0.72f),
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = actionLabel,
+            color = FEED_ACCENT,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
+        FeedChevron(pointsUp = !expanded)
+    }
+}
+
+@Composable
+private fun FeedChevron(pointsUp: Boolean) {
+    Canvas(
+        modifier = Modifier
+            .padding(start = 6.dp)
+            .size(16.dp),
+    ) {
+        val strokeWidth = 1.8.dp.toPx()
+        val tipY = if (pointsUp) size.height * 0.34f else size.height * 0.66f
+        val wingY = if (pointsUp) size.height * 0.66f else size.height * 0.34f
+        drawLine(
+            color = Color.White.copy(alpha = 0.86f),
+            start = Offset(size.width * 0.18f, wingY),
+            end = Offset(size.width * 0.5f, tipY),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = Color.White.copy(alpha = 0.86f),
+            start = Offset(size.width * 0.5f, tipY),
+            end = Offset(size.width * 0.82f, wingY),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
 @Composable
 private fun FeedMetadata(
     item: FeedVideoItem,
+    playbackState: VideoPlaybackState,
     linkState: OriginalMessageLinkUiState,
     onShowDetails: (VideoKey) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val playingVideo = when (playbackState) {
+        VideoPlaybackState.Idle -> null
+        is VideoPlaybackState.Loading -> playbackState.video
+        is VideoPlaybackState.Ready -> playbackState.video
+        is VideoPlaybackState.Unsupported -> playbackState.video
+        is VideoPlaybackState.Failed -> playbackState.video
+    }?.takeIf { it.key == item.video.key }
     val caption = item.video.caption
     val tagsText = item.video.tags.joinToString(separator = "  ") { tag -> tag.displayName }
+    val expandDescription = stringResource(R.string.video_details_expand_description)
     var captionOverflow by remember(item.video.key, caption) { mutableStateOf(false) }
     var tagsOverflow by remember(item.video.key, tagsText) { mutableStateOf(false) }
     val detailsAvailable = captionOverflow || tagsOverflow
@@ -1252,6 +1708,20 @@ private fun FeedMetadata(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        playingVideo?.let { video ->
+            val size = video.playbackFileSize?.let {
+                com.qixuan.channelvideoflow.feature.settings.formatByteSize(it)
+            } ?: "体积未知"
+            val source = if (video.selectedAlternative == null) "原画" else "服务端版本"
+            Text(
+                text = "$source · ${video.playbackWidth}×${video.playbackHeight} · $size" +
+                    if (video.selectedAlternative == null && minOf(video.width, video.height) > 720) {
+                        "\n当前播放高清原画，加载和流量消耗可能较大；可暂停或滑动到下一条。"
+                    } else "",
+                color = Color.White,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         if (caption.isNotBlank()) {
             Text(
                 text = caption,
@@ -1267,7 +1737,7 @@ private fun FeedMetadata(
                                     onClick = openDetails,
                                 )
                                 .semantics {
-                                    contentDescription = "展开视频详情"
+                                    contentDescription = expandDescription
                                 }
                                 .padding(vertical = 4.dp)
                         } else {
@@ -1276,7 +1746,7 @@ private fun FeedMetadata(
                     ),
                 color = Color.White.copy(alpha = 0.94f),
                 style = MaterialTheme.typography.bodyMedium,
-                maxLines = 3,
+                maxLines = EXPANDED_CAPTION_MAX_LINES,
                 overflow = TextOverflow.Ellipsis,
                 onTextLayout = { result ->
                     if (captionOverflow != result.hasVisualOverflow) {
@@ -1305,10 +1775,10 @@ private fun FeedMetadata(
                 modifier = Modifier
                     .heightIn(min = 48.dp)
                     .testTag(VideoFeedTestTags.DetailsExpand)
-                    .semantics { contentDescription = "展开视频详情" },
+                    .semantics { contentDescription = expandDescription },
             ) {
                 Text(
-                    text = "展开",
+                    text = stringResource(R.string.video_details_expand),
                     color = FEED_ACCENT,
                     fontWeight = FontWeight.SemiBold,
                 )
@@ -1322,7 +1792,7 @@ private fun FeedMetadata(
         when (linkState) {
             OriginalMessageLinkUiState.Idle -> Unit
             OriginalMessageLinkUiState.Loading -> Text(
-                "正在获取原消息链接…",
+                stringResource(R.string.video_original_link_loading),
                 color = Color.White.copy(alpha = 0.72f),
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -1341,6 +1811,7 @@ private fun VideoDetailsBottomSheet(
     item: FeedVideoItem,
     onDismiss: () -> Unit,
 ) {
+    val detailsTitle = stringResource(R.string.video_details_title)
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val coroutineScope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
@@ -1362,7 +1833,7 @@ private fun VideoDetailsBottomSheet(
         sheetState = sheetState,
         modifier = Modifier
             .testTag(VideoFeedTestTags.DetailsSheet)
-            .semantics { paneTitle = "视频详情" },
+            .semantics { paneTitle = detailsTitle },
         containerColor = ChannelVideoFlowTokens.Feed.elevatedGraphite,
         contentColor = Color.White,
         scrimColor = Color.Black.copy(alpha = 0.78f),
@@ -1392,7 +1863,7 @@ private fun VideoDetailsBottomSheet(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "视频详情",
+                    text = detailsTitle,
                     modifier = Modifier.semantics { heading() },
                     color = Color.White,
                     style = MaterialTheme.typography.titleLarge,
@@ -1407,13 +1878,13 @@ private fun VideoDetailsBottomSheet(
                 ) {
                     FeedIcon(
                         type = FeedIconType.CLOSE,
-                        description = "关闭视频详情",
+                        description = stringResource(R.string.video_details_close),
                         tint = Color.White.copy(alpha = 0.88f),
                     )
                 }
             }
             if (item.channelTitle.isNotBlank()) {
-                VideoDetailsSection(label = "频道") {
+                VideoDetailsSection(label = stringResource(R.string.video_details_channel)) {
                     Text(
                         text = item.channelTitle,
                         color = Color.White,
@@ -1423,7 +1894,7 @@ private fun VideoDetailsBottomSheet(
                 }
             }
             if (item.video.caption.isNotBlank()) {
-                VideoDetailsSection(label = "文案") {
+                VideoDetailsSection(label = stringResource(R.string.video_details_caption)) {
                     Text(
                         text = item.video.caption,
                         modifier = Modifier.testTag(VideoFeedTestTags.DetailsCaption),
@@ -1433,7 +1904,7 @@ private fun VideoDetailsBottomSheet(
                 }
             }
             if (item.video.tags.isNotEmpty()) {
-                VideoDetailsSection(label = "标签") {
+                VideoDetailsSection(label = stringResource(R.string.video_details_tags)) {
                     Text(
                         text = item.video.tags.joinToString(separator = "  ") { tag ->
                             tag.displayName
@@ -1445,7 +1916,7 @@ private fun VideoDetailsBottomSheet(
                 }
             }
             if (item.video.publishTime > 0L) {
-                VideoDetailsSection(label = "发布时间") {
+                VideoDetailsSection(label = stringResource(R.string.video_details_publish_time)) {
                     Text(
                         text = formatPublishTime(item.video.publishTime),
                         modifier = Modifier.testTag(VideoFeedTestTags.DetailsPublishTime),
@@ -1480,13 +1951,19 @@ private fun BoxScope.LandscapeFullscreenPrompt(
     onClick: () -> Unit,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
+    val fullscreenLabel = stringResource(R.string.video_fullscreen)
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val fittedVideoHeight = maxWidth * videoHeight.toFloat() / videoWidth.toFloat()
+        val fittedVideoHeight = minOf(maxHeight, maxWidth * videoHeight.toFloat() / videoWidth.toFloat())
         val videoBottom = (maxHeight + fittedVideoHeight) / 2
+        // A height-constrained video fills a landscape window. Keep the action in the
+        // viewport above the bottom metadata instead of placing it below the window.
+        val maximumPromptTop = (maxHeight - 180.dp - ChannelVideoFlowTokens.Sizes.touchTarget)
+            .coerceAtLeast(0.dp)
+        val promptTop = minOf(videoBottom + 14.dp, maximumPromptTop)
         Row(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .offset(y = videoBottom + 14.dp)
+                .offset(y = promptTop)
                 .controlPressScale(interactionSource)
                 .clip(RoundedCornerShape(18.dp))
                 .background(Color.Black.copy(alpha = 0.28f))
@@ -1502,7 +1979,7 @@ private fun BoxScope.LandscapeFullscreenPrompt(
                 )
                 .semantics {
                     role = Role.Button
-                    contentDescription = "全屏观看"
+                    contentDescription = fullscreenLabel
                 }
                 .testTag(VideoFeedTestTags.Fullscreen)
                 .sizeIn(minHeight = ChannelVideoFlowTokens.Sizes.touchTarget)
@@ -1512,12 +1989,12 @@ private fun BoxScope.LandscapeFullscreenPrompt(
         ) {
             FeedIcon(
                 type = FeedIconType.FULLSCREEN,
-                description = "全屏观看",
+                description = fullscreenLabel,
                 tint = Color.White.copy(alpha = 0.92f),
                 iconSize = 16.dp,
             )
             Text(
-                text = "全屏观看",
+                text = fullscreenLabel,
                 color = Color.White.copy(alpha = 0.92f),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
@@ -1532,6 +2009,7 @@ private fun ExitFullscreenButton(
     modifier: Modifier = Modifier,
 ) {
     val interactionSource = remember { MutableInteractionSource() }
+    val exitFullscreenLabel = stringResource(R.string.video_exit_fullscreen)
     IconButton(
         onClick = onClick,
         interactionSource = interactionSource,
@@ -1548,7 +2026,7 @@ private fun ExitFullscreenButton(
     ) {
         FeedIcon(
             type = FeedIconType.EXIT_FULLSCREEN,
-            description = "退出全屏",
+            description = exitFullscreenLabel,
             tint = Color.White.copy(alpha = 0.92f),
             iconSize = 22.dp,
         )
@@ -1569,15 +2047,20 @@ private fun FeedActionRail(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        val muteLabel = if (isMuted) {
+            stringResource(R.string.video_sound_on)
+        } else {
+            stringResource(R.string.video_mute)
+        }
         FeedActionButton(
-            label = if (isMuted) "声音" else "静音",
+            label = muteLabel,
             icon = if (isMuted) FeedIconType.MUTED else FeedIconType.VOLUME,
             testTag = VideoFeedTestTags.Mute,
             enabled = interactionEnabled,
             onClick = onToggleMute,
         )
         FeedActionButton(
-            label = "原消息",
+            label = stringResource(R.string.video_original_message),
             icon = FeedIconType.EXTERNAL_LINK,
             testTag = VideoFeedTestTags.OriginalLink,
             enabled = interactionEnabled && !originalLinkLoading,
@@ -1643,10 +2126,11 @@ private fun PausedPlaybackOverlay(
     enabled: Boolean,
     onClick: () -> Unit,
 ) {
+    val resumeLabel = stringResource(R.string.video_resume)
     val interactionModifier = if (enabled) {
         Modifier
             .clickable(onClick = onClick)
-            .semantics { contentDescription = "继续播放" }
+            .semantics { contentDescription = resumeLabel }
     } else {
         Modifier.clearAndSetSemantics { }
     }
@@ -1662,7 +2146,7 @@ private fun PausedPlaybackOverlay(
     ) {
         FeedIcon(
             type = FeedIconType.PLAY,
-            description = "继续播放",
+            description = resumeLabel,
             tint = Color.White.copy(alpha = 0.78f),
         )
     }
@@ -1754,7 +2238,7 @@ private fun PlaybackProgressBar(
     ) {
         Canvas(
             modifier = Modifier
-                .align(Alignment.BottomCenter)
+                .align(Alignment.Center)
                 .fillMaxWidth()
                 .height(if (isScrubbing) 5.dp else 2.dp),
         ) {
@@ -1824,6 +2308,23 @@ private fun ProtectedContentWindowEffect(isProtected: Boolean) {
 }
 
 @Composable
+private fun KeepScreenOnEffect(keepScreenOn: Boolean) {
+    val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
+    val controller = remember(activity) {
+        activity?.window?.let(::WindowScreenOnController)
+    }
+
+    DisposableEffect(controller, keepScreenOn) {
+        controller?.setKeepScreenOn(keepScreenOn)
+        onDispose {
+            // Leaving playback controls while still playing must not leave the flag behind.
+            if (keepScreenOn) controller?.setKeepScreenOn(false)
+        }
+    }
+}
+
+@Composable
 private fun FullscreenSystemUiEffect(isFullscreen: Boolean) {
     val context = LocalContext.current
     val activity = remember(context) { context.findActivity() }
@@ -1888,6 +2389,24 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 
 private fun IndexedVideo.isLandscapeVideo(): Boolean = width > height && height > 0
 
+/**
+ * Single-line text for the collapsed description bar: the caption when it exists, otherwise the
+ * tags, flattened so a multi-line caption cannot push the bar taller than one row.
+ */
+internal fun IndexedVideo.descriptionPreview(): String = caption
+    .ifBlank { tags.joinToString(separator = "  ") { tag -> tag.displayName } }
+    .replace('\n', ' ')
+    .trim()
+
+/**
+ * True only while playback is actually running. Pausing, ending the feed or leaving the playback
+ * phase must hand the screen back to the system display timeout.
+ */
+internal fun shouldKeepScreenOn(uiState: VideoPlaybackUiState): Boolean =
+    uiState.phase == VideoFeedPhase.CONTENT &&
+        uiState.player.isPlaying &&
+        !uiState.player.isPaused
+
 private fun VideoPlaybackState.videoKeyOrNull(): VideoKey? = when (this) {
     VideoPlaybackState.Idle -> null
     is VideoPlaybackState.Loading -> video.key
@@ -1914,13 +2433,13 @@ private fun ImmersiveLoadingState() {
             strokeWidth = 3.dp,
         )
         Text(
-            text = "正在加载视频",
+            text = stringResource(R.string.video_loading_title),
             color = Color.White,
             fontSize = 21.sp,
             fontWeight = FontWeight.SemiBold,
         )
         Text(
-            text = "正在读取已选择频道的视频索引",
+            text = stringResource(R.string.video_loading_message),
             color = Color.White.copy(alpha = 0.46f),
             style = MaterialTheme.typography.bodyMedium,
         )
@@ -1932,6 +2451,7 @@ private fun ImmersiveVideoLoadingState(
     video: IndexedVideo,
     visible: Boolean,
 ) {
+    val loadingDescription = stringResource(R.string.video_preparing)
     val paletteIndex = videoPosterPaletteIndex(video.key)
     val palette = VIDEO_POSTER_PALETTES[paletteIndex]
     val ambientBrush = remember(paletteIndex) {
@@ -1994,7 +2514,7 @@ private fun ImmersiveVideoLoadingState(
                 .background(vignetteBrush)
                 .testTag(VideoFeedTestTags.LoadingPoster)
                 .semantics {
-                    contentDescription = "正在准备视频"
+                    contentDescription = loadingDescription
                     loadingPosterAlpha = renderedAlpha
                     loadingPosterPalette = paletteIndex
                     loadingPosterVideoIdentity = video.key.posterIdentity()
@@ -2074,13 +2594,13 @@ private fun ImmersiveVideoLoadingState(
                         }
                     }
                     Text(
-                        text = "正在准备视频",
+                        text = loadingDescription,
                         color = Color.White.copy(alpha = 0.94f),
                         fontSize = 18.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(
-                        text = "真实首帧到达后自动播放",
+                        text = stringResource(R.string.video_preparing_message),
                         color = Color.White.copy(alpha = 0.48f),
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -2094,9 +2614,9 @@ private fun ImmersiveVideoLoadingState(
 private fun ImmersiveEmptyState(onBack: () -> Unit) {
     ImmersiveStatusState(
         icon = FeedStateIcon.EMPTY,
-        title = "暂无可播放视频",
-        message = "请调整频道选择，或等待视频索引完成",
-        actionLabel = "返回频道选择",
+        title = stringResource(R.string.video_empty_title),
+        message = stringResource(R.string.video_empty_message),
+        actionLabel = stringResource(R.string.video_back_channels),
         actionTestTag = VideoFeedTestTags.EmptyAction,
         titleTestTag = VideoFeedTestTags.Empty,
         onAction = onBack,
@@ -2104,12 +2624,25 @@ private fun ImmersiveEmptyState(onBack: () -> Unit) {
 }
 
 @Composable
+private fun ImmersiveFeedFailureState(onRetry: () -> Unit) {
+    ImmersiveStatusState(
+        icon = FeedStateIcon.ERROR,
+        title = stringResource(R.string.video_feed_database_error_title),
+        message = stringResource(R.string.video_feed_database_error_message),
+        actionLabel = stringResource(R.string.video_retry),
+        actionTestTag = VideoFeedTestTags.EmptyAction,
+        titleTestTag = VideoFeedTestTags.FeedError,
+        onAction = onRetry,
+    )
+}
+
+@Composable
 private fun ImmersiveMessageUnavailableState(onBack: () -> Unit) {
     ImmersiveStatusState(
         icon = FeedStateIcon.UNSUPPORTED,
-        title = "视频已不可播放",
-        message = "消息已删除或不再是普通视频",
-        actionLabel = "返回频道选择",
+        title = stringResource(R.string.video_message_unavailable_title),
+        message = stringResource(R.string.video_message_unavailable_message),
+        actionLabel = stringResource(R.string.video_back_channels),
         actionTestTag = VideoFeedTestTags.EmptyAction,
         onAction = onBack,
     )
@@ -2123,9 +2656,9 @@ private fun ImmersivePlaybackFailure(
     val presentation = failure.presentation()
     ImmersiveStatusState(
         icon = presentation.icon,
-        title = presentation.title,
-        message = presentation.message,
-        actionLabel = "重试",
+        title = stringResource(presentation.titleRes),
+        message = stringResource(presentation.messageRes),
+        actionLabel = stringResource(R.string.video_retry),
         actionTestTag = VideoFeedTestTags.Retry,
         onAction = onRetry,
     )
@@ -2138,9 +2671,11 @@ private fun ImmersiveUnsupportedState(
 ) {
     ImmersiveStatusState(
         icon = FeedStateIcon.UNSUPPORTED,
-        title = "该视频暂不支持流式播放。",
-        message = "可继续上下滑动，或前往 Telegram 查看原消息",
-        actionLabel = if (linkLoading) "正在打开…" else "打开原消息",
+        title = stringResource(R.string.video_streaming_unsupported_title),
+        message = stringResource(R.string.video_streaming_unsupported_message),
+        actionLabel = stringResource(
+            if (linkLoading) R.string.video_opening else R.string.video_open_original,
+        ),
         actionTestTag = VideoFeedTestTags.OriginalLink,
         actionEnabled = !linkLoading,
         onAction = onOriginalMessage,
@@ -2207,10 +2742,11 @@ private fun ImmersiveStatusState(
 
 @Composable
 private fun FeedStateGraphic(icon: FeedStateIcon) {
+    val description = stringResource(icon.descriptionRes)
     Canvas(
         modifier = Modifier
             .size(92.dp)
-            .semantics { contentDescription = icon.description },
+            .semantics { contentDescription = description },
     ) {
         val color = Color(0xFF3A3A3A)
         val strokeWidth = 8.dp.toPx()
@@ -2538,52 +3074,52 @@ private fun FeedIcon(
 private fun VideoPlaybackFailure.presentation(): FailurePresentation = when (this) {
     VideoPlaybackFailure.NETWORK -> FailurePresentation(
         icon = FeedStateIcon.NETWORK,
-        title = "网络错误",
-        message = "请检查网络连接后重试",
+        titleRes = R.string.video_failure_network_title,
+        messageRes = R.string.video_failure_network_message,
     )
     VideoPlaybackFailure.TIMEOUT -> FailurePresentation(
         icon = FeedStateIcon.NETWORK,
-        title = "加载超时",
-        message = "网络响应较慢，请稍后重试",
+        titleRes = R.string.video_failure_timeout_title,
+        messageRes = R.string.video_failure_timeout_message,
     )
     VideoPlaybackFailure.FILE_UNAVAILABLE -> FailurePresentation(
         icon = FeedStateIcon.ERROR,
-        title = "视频暂时不可用",
-        message = "Telegram 文件已失效，请重试",
+        titleRes = R.string.video_failure_file_title,
+        messageRes = R.string.video_failure_file_message,
     )
     VideoPlaybackFailure.MESSAGE_UNAVAILABLE -> FailurePresentation(
         icon = FeedStateIcon.UNSUPPORTED,
-        title = "视频已不可播放",
-        message = "消息已删除或不再是普通视频",
+        titleRes = R.string.video_message_unavailable_title,
+        messageRes = R.string.video_message_unavailable_message,
     )
     VideoPlaybackFailure.DECODER_UNSUPPORTED -> FailurePresentation(
         icon = FeedStateIcon.UNSUPPORTED,
-        title = "无法播放",
-        message = "设备不支持该视频编码",
+        titleRes = R.string.video_failure_decoder_title,
+        messageRes = R.string.video_failure_decoder_message,
     )
     VideoPlaybackFailure.PLAYER -> FailurePresentation(
         icon = FeedStateIcon.ERROR,
-        title = "播放出错",
-        message = "播放器发生错误，请重试",
+        titleRes = R.string.video_failure_player_title,
+        messageRes = R.string.video_failure_player_message,
     )
     VideoPlaybackFailure.UNKNOWN -> FailurePresentation(
         icon = FeedStateIcon.ERROR,
-        title = "播放出错",
-        message = "发生未知错误，请重试",
+        titleRes = R.string.video_failure_player_title,
+        messageRes = R.string.video_failure_unknown_message,
     )
 }
 
 private data class FailurePresentation(
     val icon: FeedStateIcon,
-    val title: String,
-    val message: String,
+    val titleRes: Int,
+    val messageRes: Int,
 )
 
-private enum class FeedStateIcon(val description: String) {
-    EMPTY("暂无视频"),
-    NETWORK("网络错误"),
-    UNSUPPORTED("不支持播放"),
-    ERROR("播放错误"),
+private enum class FeedStateIcon(val descriptionRes: Int) {
+    EMPTY(R.string.video_state_empty_description),
+    NETWORK(R.string.video_state_network_description),
+    UNSUPPORTED(R.string.video_state_unsupported_description),
+    ERROR(R.string.video_state_error_description),
 }
 
 private enum class FeedIconType {
@@ -2669,7 +3205,22 @@ private val PUBLISH_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter
 
 private val FEED_ACCENT = Color(0xFF68E3E0)
 private val FEED_BUTTON = Color(0xFF292929)
-private val PROGRESS_BOTTOM_OFFSET = 16.dp
+
+/**
+ * Bottom stack, measured from the safe bottom inset upwards:
+ * progress bar touch area -> progress track (centred in that area) -> collapsed description bar.
+ * The touch area starts further up than the previous 16dp so a drag cannot start on the system
+ * gesture strip, and the description bar clears the progress touch area completely.
+ */
+private val PROGRESS_BOTTOM_OFFSET = 32.dp
+private val METADATA_BOTTOM_OFFSET =
+    PROGRESS_BOTTOM_OFFSET + ChannelVideoFlowTokens.Sizes.touchTarget + 8.dp
+private val ACTION_RAIL_BOTTOM_OFFSET = 162.dp
+private val VIDEO_METADATA_MAX_WIDTH = 600.dp
+private val METADATA_SUMMARY_SHAPE = RoundedCornerShape(14.dp)
+private const val BOTTOM_SCRIM_HEIGHT_FRACTION = 0.34f
+private const val EXPANDED_CAPTION_MAX_LINES = 6
+private const val METADATA_PANEL_ANIMATION_MILLIS = 220
 
 private const val METADATA_INTERACTION_ALPHA = 0.30f
 private const val METADATA_FADE_OUT_MILLIS = 90
@@ -2679,13 +3230,14 @@ private const val METADATA_RESTORE_DELAY_MILLIS = 320L
 private const val CONTROL_PRESSED_SCALE = 0.985f
 private const val CONTROL_PRESS_IN_MILLIS = 90
 private const val CONTROL_PRESS_OUT_MILLIS = 120
+private const val CONTROL_AUTO_HIDE_MILLIS = 3_000L
+private const val CONTROL_VISIBILITY_ANIMATION_MILLIS = 160
 private const val PAUSED_OVERLAY_INITIAL_SCALE = 0.92f
 private const val PAUSED_OVERLAY_ANIMATION_MILLIS = 200
 private const val SWIPE_HINT_ENTRANCE_MILLIS = 360
 private val TEMPORARY_SPEED_TOP_PADDING = 68.dp
 private const val TEMPORARY_SPEED_ANIMATION_MILLIS = 180
 private const val TEMPORARY_SPEED_INITIAL_SCALE = 0.94f
-private const val TEMPORARY_SPEED_LABEL = "2× 快进中"
 
 internal const val VIDEO_POSTER_FADE_OUT_MILLIS = 190
 

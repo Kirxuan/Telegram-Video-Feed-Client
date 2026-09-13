@@ -1,10 +1,5 @@
 package com.qixuan.channelvideoflow.feature.settings
 
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.togetherWith
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -21,6 +16,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.Box
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -29,13 +27,11 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -44,8 +40,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -56,11 +50,9 @@ import com.qixuan.channelvideoflow.domain.cache.MediaCacheOperation
 import com.qixuan.channelvideoflow.model.video.VideoQualityPreference
 import com.qixuan.channelvideoflow.ui.components.PremiumBackdrop
 import com.qixuan.channelvideoflow.ui.components.PremiumTopBar
-import com.qixuan.channelvideoflow.ui.components.GlossActionPill
 import com.qixuan.channelvideoflow.ui.components.SettingsGroup
 import com.qixuan.channelvideoflow.ui.theme.ChannelVideoFlowTokens
 import java.util.Locale
-import kotlin.math.roundToInt
 
 internal object CacheSettingsTestTags {
     const val Usage = "cache-settings-usage"
@@ -69,6 +61,7 @@ internal object CacheSettingsTestTags {
     const val ConfirmClear = "cache-settings-confirm-clear"
     const val Logout = "cache-settings-logout"
     const val LimitSlider = "cache-settings-limit-slider"
+    const val LimitMenu = "cache-settings-limit-menu"
     fun limit(bytes: Long) = "cache-settings-limit-$bytes"
     fun quality(preference: VideoQualityPreference) = "cache-settings-quality-${preference.name}"
 }
@@ -163,6 +156,10 @@ internal fun CacheSettingsScreen(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
+                Text(
+                    text = "当前缓存上限 ${formatByteSize(uiState.cache.limitBytes)}",
+                    style = MaterialTheme.typography.titleMedium,
+                )
                 SettingsGroup(
                     title = stringResource(R.string.video_quality_title),
                     subtitle = stringResource(R.string.video_quality_summary),
@@ -283,56 +280,25 @@ private fun CacheCapacitySelector(
     selectedBytes: Long,
     onSelected: (Long) -> Unit,
 ) {
-    val options = MediaCacheLimits.allowedBytes
-    val selectedIndex = options.indexOf(selectedBytes).coerceAtLeast(0)
-    var sliderPosition by remember(selectedBytes) {
-        mutableFloatStateOf(selectedIndex.toFloat())
-    }
-    val previewIndex = sliderPosition.roundToInt().coerceIn(options.indices)
-    val previewBytes = options[previewIndex]
-
-    AnimatedContent(
-        targetState = formatByteSize(previewBytes),
-        transitionSpec = {
-            fadeIn(tween(ChannelVideoFlowTokens.Motion.stateChangeMillis)) togetherWith
-                fadeOut(tween(ChannelVideoFlowTokens.Motion.stateChangeMillis))
-        },
-        label = "cache capacity value",
-    ) { capacity ->
-        Text(
-            text = "当前上限  $capacity",
-            style = MaterialTheme.typography.titleMedium,
-        )
-    }
-    Slider(
-        value = sliderPosition,
-        onValueChange = { value -> sliderPosition = value },
-        onValueChangeFinished = { onSelected(previewBytes) },
-        valueRange = 0f..options.lastIndex.toFloat(),
-        steps = (options.size - 2).coerceAtLeast(0),
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag(CacheSettingsTestTags.LimitSlider)
-            .semantics {
-                stateDescription = "缓存上限 ${formatByteSize(previewBytes)}"
-            },
-    )
-    options.chunked(2).forEach { rowOptions ->
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(ChannelVideoFlowTokens.Spacing.small),
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        TextButton(
+            onClick = { expanded = true },
+            modifier = Modifier.testTag(CacheSettingsTestTags.LimitMenu),
         ) {
-            rowOptions.forEach { bytes ->
-                GlossActionPill(
-                    text = formatByteSize(bytes),
-                    onClick = { onSelected(bytes) },
-                    selected = selectedBytes == bytes,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag(CacheSettingsTestTags.limit(bytes)),
+            Text("当前上限 ${formatByteSize(selectedBytes)} · 更改")
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            MediaCacheLimits.allowedBytes.forEach { bytes ->
+                DropdownMenuItem(
+                    text = { Text(formatByteSize(bytes) + if (bytes == selectedBytes) "（已选）" else "") },
+                    onClick = {
+                        expanded = false
+                        onSelected(bytes)
+                    },
+                    modifier = Modifier.testTag(CacheSettingsTestTags.limit(bytes)),
                 )
             }
-            if (rowOptions.size == 1) Spacer(Modifier.weight(1f))
         }
     }
 }

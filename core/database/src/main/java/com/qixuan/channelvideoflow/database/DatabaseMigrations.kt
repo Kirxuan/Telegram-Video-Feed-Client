@@ -151,4 +151,22 @@ object DatabaseMigrations {
             )
         }
     }
+
+    /**
+     * Records when a video became invalid so physical deletion is retention-policy driven.
+     * Legacy soft-deleted rows use indexed_at as a conservative lower bound.
+     */
+    val MIGRATION_5_6 = object : Migration(5, 6) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE videos ADD COLUMN invalidated_at INTEGER")
+            db.execSQL(
+                "UPDATE videos SET invalidated_at = indexed_at " +
+                    "WHERE is_deleted = 1 AND invalidated_at IS NULL",
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS index_videos_is_deleted_invalidated_at " +
+                    "ON videos(is_deleted, invalidated_at)",
+            )
+        }
+    }
 }

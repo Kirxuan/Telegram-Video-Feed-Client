@@ -5,6 +5,8 @@ import com.qixuan.channelvideoflow.telegram.config.TelegramCredentialsProvider
 import com.qixuan.channelvideoflow.telegram.config.TelegramCredentialsResult
 import com.qixuan.channelvideoflow.telegram.logging.AuthEventLogger
 import com.qixuan.channelvideoflow.telegram.storage.TdLibDirectories
+import com.qixuan.channelvideoflow.telegram.storage.TdLibDatabaseKeyProvider
+import com.qixuan.channelvideoflow.telegram.storage.TdLibDatabaseKeyResult
 import java.nio.file.Files
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CoroutineStart
@@ -113,6 +115,80 @@ class TelegramClientManagerTest {
         assertEquals("synthetic-system", parameters.systemVersion)
         assertEquals("1.0-test", parameters.applicationVersion)
         assertEquals(1, bridge.sentFunctions.filterIsInstance<TdApi.SetTdlibParameters>().size)
+    }
+
+    @Test
+    fun encryptionCandidatePassesTheWrappedDatabaseKeyToTdLibParameters() = runTest {
+        val bridge = FakeTdLibBridge()
+        val expectedKey = ByteArray(32) { index -> (index + 1).toByte() }
+        val manager = manager(
+            bridge = bridge,
+            credentials = availableCredentials(),
+            databaseKeyProvider = TdLibDatabaseKeyProvider {
+                TdLibDatabaseKeyResult.Available(expectedKey)
+            },
+        )
+        manager.start()
+
+        bridge.emitUpdate(
+            0,
+            TdApi.UpdateAuthorizationState(TdApi.AuthorizationStateWaitTdlibParameters()),
+        )
+        runCurrent()
+
+        val parameters = bridge.sentFunctions.single() as TdApi.SetTdlibParameters
+        assertArrayEquals(expectedKey, parameters.databaseEncryptionKey)
+    }
+
+    @Test
+    fun migrationRequiredFailsClosedWithoutSendingParametersOrRetryingTheState() = runTest {
+        val bridge = FakeTdLibBridge()
+        val manager = manager(
+            bridge = bridge,
+            credentials = availableCredentials(),
+            databaseKeyProvider = TdLibDatabaseKeyProvider {
+                TdLibDatabaseKeyResult.MigrationRequired
+            },
+        )
+        val events = recordEvents(manager)
+        manager.start()
+        val state = TdApi.AuthorizationStateWaitTdlibParameters()
+
+        bridge.emitUpdate(0, TdApi.UpdateAuthorizationState(state))
+        runCurrent()
+        bridge.emitUpdate(0, TdApi.UpdateAuthorizationState(state))
+        runCurrent()
+
+        assertTrue(events.contains(TelegramClientEvent.FatalFailure(FatalCategory.DATABASE)))
+        assertTrue(bridge.sentFunctions.none { it is TdApi.SetTdlibParameters })
+        assertEquals(1, bridge.sentFunctions.count { it is TdApi.Close })
+    }
+
+    @Test
+    fun rejectedDatabaseKeyIsClassifiedAsDatabaseFailureAndClosesTheSession() = runTest {
+        val bridge = FakeTdLibBridge()
+        val manager = manager(
+            bridge = bridge,
+            credentials = availableCredentials(),
+            databaseKeyProvider = TdLibDatabaseKeyProvider {
+                TdLibDatabaseKeyResult.Available(ByteArray(32) { 7 })
+            },
+        )
+        val events = recordEvents(manager)
+        manager.start()
+        bridge.emitUpdate(
+            0,
+            TdApi.UpdateAuthorizationState(TdApi.AuthorizationStateWaitTdlibParameters()),
+        )
+        runCurrent()
+        val parameters = bridge.sentFunctions.single() as TdApi.SetTdlibParameters
+
+        bridge.complete(0, parameters, TdApi.Error(401, "synthetic invalid database key"))
+        runCurrent()
+
+        assertTrue(events.contains(TelegramClientEvent.FatalFailure(FatalCategory.DATABASE)))
+        assertTrue(events.none { it is TelegramClientEvent.RequestFailed })
+        assertEquals(1, bridge.sentFunctions.count { it is TdApi.Close })
     }
 
     @Test
@@ -624,6 +700,9 @@ class TelegramClientManagerTest {
         credentials: TelegramCredentialsProvider,
         logger: AuthEventLogger = RecordingLogger(),
         directories: TdLibDirectories = temporaryDirectories(),
+        databaseKeyProvider: TdLibDatabaseKeyProvider = TdLibDatabaseKeyProvider {
+            TdLibDatabaseKeyResult.LegacyUnencrypted
+        },
     ): TelegramClientManager = TelegramClientManager(
         credentialsProvider = credentials,
         directories = directories,
@@ -631,6 +710,7 @@ class TelegramClientManagerTest {
         logger = logger,
         applicationInfo = FakeApplicationInfo,
         dispatcher = UnconfinedTestDispatcher(testScheduler),
+        databaseKeyProvider = databaseKeyProvider,
     )
 
     private fun TestScope.recordEvents(

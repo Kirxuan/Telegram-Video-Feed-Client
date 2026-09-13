@@ -1,14 +1,20 @@
 package com.qixuan.channelvideoflow.telegram.message
 
+import android.os.SystemClock
+import android.util.Log
 import com.qixuan.channelvideoflow.database.ChannelEntity
 import com.qixuan.channelvideoflow.database.ChannelScanRecord
 import com.qixuan.channelvideoflow.database.PersistedVideo
 import com.qixuan.channelvideoflow.database.PersistedVideoTag
 import com.qixuan.channelvideoflow.database.VideoEntity
 import com.qixuan.channelvideoflow.database.VideoPageWrite
+import com.qixuan.channelvideoflow.telegram.BuildConfig
 import com.qixuan.channelvideoflow.domain.message.TelegramMessageRepository
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservation
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservationFailure
 import com.qixuan.channelvideoflow.domain.message.VideoReferenceFailure
 import com.qixuan.channelvideoflow.domain.message.VideoReferenceResolution
+import com.qixuan.channelvideoflow.domain.message.VideoFeedKeySnapshot
 import com.qixuan.channelvideoflow.domain.video.HashtagParser
 import com.qixuan.channelvideoflow.domain.video.Utf16TextRange
 import com.qixuan.channelvideoflow.model.channel.ChannelAccessState
@@ -37,6 +43,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.awaitAll
@@ -45,9 +52,10 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -67,6 +75,35 @@ internal fun interface MessageScanJitter {
     fun nextMillis(upperBoundInclusive: Long): Long
 }
 
+private fun <T> Flow<T>.withDatabaseFailure(initialValue: T): Flow<RepositoryObservation<T>> = flow {
+    var latestValue = initialValue
+    var failures = 0
+    while (currentCoroutineContext().isActive) {
+        try {
+            collect { value ->
+                latestValue = value
+                emit(RepositoryObservation(value))
+            }
+            return@flow
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (_: Throwable) {
+            emit(
+                RepositoryObservation(
+                    value = latestValue,
+                    failure = RepositoryObservationFailure.DATABASE,
+                ),
+            )
+            failures += 1
+            if (failures >= 3) return@flow
+            delay(OBSERVATION_RETRY_DELAY_MILLIS * failures)
+        }
+    }
+}
+
+private const val OBSERVATION_RETRY_DELAY_MILLIS = 1_000L
+
+@OptIn(ExperimentalCoroutinesApi::class)
 internal class TdLibTelegramMessageRepository(
     private val client: TelegramMessageClient,
     private val store: MessageIndexStore,
@@ -77,10 +114,13 @@ internal class TdLibTelegramMessageRepository(
         Random.Default.nextLong(upperBoundInclusive + 1)
     },
 ) : TelegramMessageRepository {
-    override val scanProgress: Flow<List<ChannelVideoScanProgress>> = store
+    override val scanProgressObservation: Flow<RepositoryObservation<List<ChannelVideoScanProgress>>> = store
         .observeSelectedChannelScans()
         .map { records -> records.map(::mapProgress) }
-        .catch { emit(emptyList()) }
+        .withDatabaseFailure(emptyList())
+
+    override val scanProgress: Flow<List<ChannelVideoScanProgress>> =
+        scanProgressObservation.map { observation -> observation.value }
 
     private val lifecycleMutex = Mutex()
     private val refreshSingleFlight = VideoRefreshSingleFlight(scope)
@@ -89,6 +129,7 @@ internal class TdLibTelegramMessageRepository(
     private val scanFloodWaitMutex = Mutex()
     private var scanFloodWaitUntilMillis = 0L
     private val foreground = AtomicBoolean(false)
+    private val retentionCleanupPending = AtomicBoolean(true)
     private var coordinatorJob: Job? = null
 
     init {
@@ -105,31 +146,122 @@ internal class TdLibTelegramMessageRepository(
         }
     }
 
-    override fun observeVideos(filter: VideoFilter): Flow<List<IndexedVideo>> = store
-        .observeFilteredVideos(filter.channelIds, filter.normalizedTags, filter.tagMode)
-        .map { entities ->
-            val tagsByKey = store.getVideoTagsForChannels(filter.channelIds.sorted())
+    override fun observeVideoObservation(
+        filter: VideoFilter,
+    ): Flow<RepositoryObservation<List<IndexedVideo>>> = observeVideoKeyObservation(filter)
+        .mapLatest { keyObservation ->
+            if (keyObservation.failure != null) {
+                return@mapLatest RepositoryObservation(emptyList(), keyObservation.failure)
+            }
+            val hydrated = ArrayList<IndexedVideo>(keyObservation.value.size)
+            for (window in keyObservation.value.map(VideoFeedKeySnapshot::key)
+                .chunked(HYDRATION_QUERY_WINDOW_SIZE)) {
+                val observation = hydrateVideos(window)
+                if (observation.failure != null) {
+                    return@mapLatest RepositoryObservation(emptyList(), observation.failure)
+                }
+                hydrated += observation.value
+            }
+            RepositoryObservation(hydrated)
+        }
+
+    override fun observeVideos(filter: VideoFilter): Flow<List<IndexedVideo>> =
+        observeVideoObservation(filter).map { observation -> observation.value }
+
+    override fun observeVideoKeyObservation(
+        filter: VideoFilter,
+    ): Flow<RepositoryObservation<List<VideoFeedKeySnapshot>>> = flow {
+        var previousEmissionAt = SystemClock.elapsedRealtime()
+        var firstEmission = true
+        store.observeFilteredVideoKeys(filter.channelIds, filter.normalizedTags, filter.tagMode)
+            .collect { rows ->
+                val now = SystemClock.elapsedRealtime()
+                val observationGapMillis = (now - previousEmissionAt).coerceAtLeast(0L)
+                // A Room Flow's subsequent emission includes the time the database stayed idle
+                // between invalidations. Initial subscription latency includes scheduling;
+                // it is not a measurement of SQLite execution time.
+                val firstEmissionMillis = if (firstEmission) observationGapMillis else null
+                traceFeedPerformance(
+                    firstEmissionMillis = firstEmissionMillis,
+                    observationGapMillis = if (firstEmission) null else observationGapMillis,
+                    snapshotKeys = rows.size,
+                )
+                emit(
+                    rows.map { row ->
+                        VideoFeedKeySnapshot(
+                            key = VideoKey(row.chatId, row.messageId),
+                            publishTime = row.publishTime,
+                            editTime = row.editTime,
+                        )
+                    },
+                )
+                previousEmissionAt = now
+                firstEmission = false
+            }
+    }
+        .withDatabaseFailure(emptyList())
+
+    override suspend fun hydrateVideos(
+        keys: List<VideoKey>,
+    ): RepositoryObservation<List<IndexedVideo>> {
+        if (keys.isEmpty()) return RepositoryObservation(emptyList())
+        val startedAt = SystemClock.elapsedRealtime()
+        return try {
+            val keyPairs = keys.map { key -> key.chatId to key.messageId }
+            val tagsByKey = store.getVideoTagsForKeyWindow(keyPairs)
                 .groupBy { record -> VideoKey(record.chatId, record.messageId) }
-            entities.map { entity ->
-                entity.toModel(
-                    tagsByKey[VideoKey(entity.chatId, entity.messageId)]
-                        .orEmpty()
-                        .map { record ->
+            val entitiesByKey = store.getVideosForKeyWindow(keyPairs)
+                .associateBy { entity -> VideoKey(entity.chatId, entity.messageId) }
+            val observation = RepositoryObservation(
+                keys.mapNotNull { key ->
+                    entitiesByKey[key]?.toModel(
+                        tagsByKey[key].orEmpty().map { record ->
                             VideoTag(record.normalizedTagName, record.displayName)
                         },
-                )
-            }
+                    )
+                },
+            )
+            traceFeedPerformance(
+                hydrateMillis = SystemClock.elapsedRealtime() - startedAt,
+                hydratedItems = observation.value.size,
+            )
+            observation
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (_: Throwable) {
+            RepositoryObservation(emptyList(), RepositoryObservationFailure.DATABASE)
         }
-        .catch { emit(emptyList()) }
+    }
 
-    override fun observeTags(channelIds: Set<Long>): Flow<List<TagSummary>> = store
+    private fun traceFeedPerformance(
+        firstEmissionMillis: Long? = null,
+        observationGapMillis: Long? = null,
+        hydrateMillis: Long? = null,
+        snapshotKeys: Int? = null,
+        hydratedItems: Int? = null,
+    ) {
+        if (!BuildConfig.PERFORMANCE_DIAGNOSTICS_ENABLED) return
+        Log.i(
+            FEED_PERF_TAG,
+            "summary firstEmissionMs=$firstEmissionMillis hydrateMs=$hydrateMillis " +
+                "observationGapMs=$observationGapMillis " +
+                "snapshotKeys=$snapshotKeys hydratedItems=$hydratedItems",
+        )
+    }
+
+    override fun observeTagObservation(
+        channelIds: Set<Long>,
+    ): Flow<RepositoryObservation<List<TagSummary>>> = store
         .observeTagSummaries(channelIds)
         .map { records ->
             records.map { record ->
                 TagSummary(record.normalizedName, record.displayName, record.videoCount)
             }
         }
-        .catch { emit(emptyList()) }
+        .withDatabaseFailure(emptyList())
+
+    override fun observeTags(channelIds: Set<Long>): Flow<List<TagSummary>> =
+        observeTagObservation(channelIds).map { observation -> observation.value }
 
     override suspend fun refreshVideo(videoKey: VideoKey): VideoReferenceResolution {
         currentRefreshFloodWait()?.let { failure ->
@@ -150,7 +282,11 @@ internal class TdLibTelegramMessageRepository(
             is TelegramClientResult.Success -> refreshed.value
             is TelegramClientResult.Failure -> {
                 if (refreshed.failure == TelegramClientFailure.NotFound) {
-                    store.deleteMessages(videoKey.chatId, listOf(videoKey.messageId))
+                    store.deleteMessages(
+                        videoKey.chatId,
+                        listOf(videoKey.messageId),
+                        clock.nowMillis(),
+                    )
                     return VideoReferenceResolution.MessageMissing
                 }
                 val failure = refreshed.failure.toReferenceFailure()
@@ -165,13 +301,13 @@ internal class TdLibTelegramMessageRepository(
         }
         val refreshedVideo = message.video
             ?: run {
-                store.markUnsupportedEdit(videoKey.chatId, videoKey.messageId)
+                store.markUnsupportedEdit(videoKey.chatId, videoKey.messageId, clock.nowMillis())
                 return VideoReferenceResolution.UnsupportedMessage
             }
         val indexedAt = clock.nowMillis()
         val persisted = message.toPersistedVideo(indexedAt)
             ?: run {
-                store.markUnsupportedEdit(videoKey.chatId, videoKey.messageId)
+                store.markUnsupportedEdit(videoKey.chatId, videoKey.messageId, clock.nowMillis())
                 return VideoReferenceResolution.UnsupportedMessage
             }
         store.replaceVideoAndTags(persisted)
@@ -246,6 +382,14 @@ internal class TdLibTelegramMessageRepository(
     }
 
     override suspend fun setForeground(isForeground: Boolean) {
+        if (isForeground && retentionCleanupPending.compareAndSet(true, false)) {
+            try {
+                store.purgeInvalidatedBefore(retentionCutoff(clock.nowMillis()))
+            } catch (failure: Throwable) {
+                retentionCleanupPending.set(true)
+                throw failure
+            }
+        }
         lifecycleMutex.withLock {
             foreground.set(isForeground)
             coordinatorJob?.cancel()
@@ -561,7 +705,7 @@ internal class TdLibTelegramMessageRepository(
                 val existing = store.getVideo(event.chatId, event.messageId)
                 val content = event.video
                 if (existing != null && content == null) {
-                    store.markUnsupportedEdit(event.chatId, event.messageId)
+                    store.markUnsupportedEdit(event.chatId, event.messageId, clock.nowMillis())
                 } else if (existing != null && content != null) {
                     store.replaceVideoAndTags(content.toPersistedVideo(existing, clock.nowMillis()))
                 } else if (content != null) {
@@ -586,7 +730,7 @@ internal class TdLibTelegramMessageRepository(
                 event.editTime,
             )
             is TelegramMessageClientEvent.MessagesDeleted -> if (!event.fromCache) {
-                store.deleteMessages(event.chatId, event.messageIds)
+                store.deleteMessages(event.chatId, event.messageIds, clock.nowMillis())
             }
             TelegramMessageClientEvent.AccountLoggingOut -> {
                 refreshSingleFlight.cancelAll()
@@ -806,6 +950,9 @@ internal class TdLibTelegramMessageRepository(
             .coerceAtMost(MAX_RETRY_DELAY_MILLIS)
             .let { base -> base + jitter.nextMillis(base / 4) }
 
+    private fun retentionCutoff(nowMillis: Long): Long =
+        (nowMillis - DELETED_VIDEO_RETENTION_MILLIS).coerceAtLeast(0L)
+
     private data class RecentSyncSession(
         val boundaryMessageId: Long?,
         var fromMessageId: Long = 0,
@@ -817,6 +964,9 @@ internal class TdLibTelegramMessageRepository(
         const val MAX_CONCURRENT_CHANNELS = 2
         const val REQUEST_TIMEOUT_MILLIS = 15_000L
         const val MAX_REQUEST_ATTEMPTS = 3
+        const val HYDRATION_QUERY_WINDOW_SIZE = 64
+        const val DELETED_VIDEO_RETENTION_MILLIS = 30L * 24L * 60L * 60L * 1_000L
+        const val FEED_PERF_TAG = "CVF-FeedPerf"
         const val BASE_RETRY_DELAY_MILLIS = 1_000L
         const val MAX_RETRY_DELAY_MILLIS = 8_000L
         const val FAILURE_NETWORK = "NETWORK"

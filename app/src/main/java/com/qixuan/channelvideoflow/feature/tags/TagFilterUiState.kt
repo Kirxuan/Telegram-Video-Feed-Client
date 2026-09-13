@@ -3,6 +3,7 @@ package com.qixuan.channelvideoflow.feature.tags
 import com.qixuan.channelvideoflow.model.video.TagFilterMode
 import com.qixuan.channelvideoflow.model.video.TagSummary
 import com.qixuan.channelvideoflow.model.video.VideoFilter
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservationFailure
 
 data class TagFilterItem(
     val summary: TagSummary,
@@ -17,6 +18,7 @@ data class TagFilterUiState(
     val selectedNames: Set<String> = emptySet(),
     val mode: TagFilterMode = TagFilterMode.OR,
     val searchQuery: String = "",
+    val observationFailure: RepositoryObservationFailure? = null,
 ) {
     val canContinue: Boolean get() = channelIds.isNotEmpty()
     val hasActiveSearch: Boolean get() = normalizeTagSearchQuery(searchQuery).isNotEmpty()

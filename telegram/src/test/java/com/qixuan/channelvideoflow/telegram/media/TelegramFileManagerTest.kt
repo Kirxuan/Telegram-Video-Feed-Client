@@ -364,6 +364,42 @@ class TelegramFileManagerTest {
             prefixHandler = { _, _ -> TelegramClientResult.Success(1L) }
         }
         val manager = TelegramFileManager(client, scope, privateFileReadable = { true })
+        // A satisfied playback owner on a different file must not affect this file's
+        // preload sizing; playback ownership only steers the file it belongs to.
+        val seed = manager.acquireRange(55, 0, 8, TelegramFileRequestPriority.CURRENT_CONTINUATION, "seed")
+        runCurrent()
+        client.completeNext(
+            TelegramClientResult.Success(snapshot(55, 0, 8, size = 1_000_000L)),
+        )
+        runCurrent()
+        client.updates.emit(TelegramFileClientEvent.FileUpdated(snapshot(55, 0, 8, size = 1_000_000L)))
+        runCurrent()
+        val next = manager.acquireRange(
+            fileId = 56,
+            offset = 0,
+            length = 256L * 1024L,
+            priority = TelegramFileRequestPriority.NEXT_PRELOAD,
+            ownerToken = "next",
+            ownerKind = TelegramFileOwnerKind.NEXT_PRELOAD,
+            readAheadBytes = 256L * 1024L,
+        )
+        advanceUntilIdle()
+
+        val nextRequest = client.requests.last { request -> request.fileId == 56 }
+        assertEquals(256L * 1024L, nextRequest.limit)
+        assertTrue(nextRequest.limit <= 256L * 1024L)
+        seed.close()
+        next.close()
+        scope.cancel()
+    }
+
+    @Test
+    fun residualPreloadOwnerYieldsToPlaybackOwnershipOnTheSameFile() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val client = FakeFileClient().apply {
+            prefixHandler = { _, _ -> TelegramClientResult.Success(1L) }
+        }
+        val manager = TelegramFileManager(client, scope, privateFileReadable = { true })
         val seed = manager.acquireRange(56, 0, 8, TelegramFileRequestPriority.CURRENT_CONTINUATION, "seed")
         runCurrent()
         client.completeNext(
@@ -372,6 +408,7 @@ class TelegramFileManagerTest {
         runCurrent()
         client.updates.emit(TelegramFileClientEvent.FileUpdated(snapshot(56, 0, 8, size = 1_000_000L)))
         runCurrent()
+        val requestsBeforeResidual = client.requests.size
         val next = manager.acquireRange(
             fileId = 56,
             offset = 8,
@@ -383,8 +420,17 @@ class TelegramFileManagerTest {
         )
         advanceUntilIdle()
 
-        assertEquals(256L * 1024L, client.requests.last().limit)
-        assertTrue(client.requests.last().limit <= 256L * 1024L)
+        // The same file still carries a playback owner (the seed). A residual preload
+        // owner must not steer the download window back to its own offset any more: this
+        // suppression is what stops the cancel/SWITCH oscillation observed on the device,
+        // and the range it wanted is covered by the playback read-ahead when consumption
+        // advances.
+        val afterResidual = client.requests.drop(requestsBeforeResidual)
+        assertTrue(
+            "residual preload must not publish new requests while playback owns the file, " +
+                "got " + afterResidual.map(Request::offset),
+            afterResidual.isEmpty(),
+        )
         seed.close()
         next.close()
         scope.cancel()
@@ -1281,6 +1327,103 @@ class TelegramFileManagerTest {
 
         assertEquals(0L, budget.remainingWaitMillis(150L))
         assertEquals("NO_PROGRESS", budget.timeoutReason(150L))
+    }
+
+    @Test
+    fun playbackOwnershipSuppressesResidualPreloadSteering() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val client = FakeFileClient()
+        val manager = TelegramFileManager(client, scope, privateFileReadable = { true })
+
+        // A leftover "next" preload owner parks at a forward offset, as when an unfinished
+        // tail chunk of a promoted preparation stays behind after a swipe.
+        val residual = manager.acquireRange(
+            fileId = 61,
+            offset = 4_096,
+            length = 256,
+            priority = TelegramFileRequestPriority.NEXT_PRELOAD,
+            ownerToken = "residual-preload",
+            ownerKind = TelegramFileOwnerKind.NEXT_PRELOAD,
+            readAheadBytes = 256,
+        )
+        runCurrent()
+        val beforePlayback = client.requests.size
+        assertTrue(
+            "the single preload owner drives its own request first",
+            client.requests.any { request -> request.offset == 4_096L },
+        )
+
+        // Playback takes over the same file at the head and its range becomes local.
+        val playback = manager.acquireRange(
+            fileId = 61,
+            offset = 0,
+            length = 256,
+            priority = TelegramFileRequestPriority.CURRENT_CONTINUATION,
+            ownerToken = "current-playback",
+            ownerKind = TelegramFileOwnerKind.CURRENT_PLAYBACK,
+            readAheadBytes = 256,
+        )
+        runCurrent()
+        client.updates.emit(TelegramFileClientEvent.FileUpdated(snapshot(61, 0, 256)))
+        runCurrent()
+        advanceUntilIdle()
+
+        // Consumption advances; every playback range is satisfied while the residual
+        // preload range never arrives. Every evaluation in this state used to steer the
+        // download window back to the residual offset, and each oscillation cancelled
+        // in-flight parts (device evidence: such files stayed near 479 KiB/s while
+        // unobstructed files reached 1.3-3.4 MiB/s).
+        val probe = manager.acquireRange(
+            fileId = 61,
+            offset = 256,
+            length = 256,
+            priority = TelegramFileRequestPriority.CURRENT_CONTINUATION,
+            ownerToken = "probe",
+            ownerKind = TelegramFileOwnerKind.CURRENT_PLAYBACK,
+            readAheadBytes = 256,
+        )
+        runCurrent()
+        client.updates.emit(TelegramFileClientEvent.FileUpdated(snapshot(61, 0, 512)))
+        runCurrent()
+        advanceUntilIdle()
+
+        val afterPlayback = client.requests.drop(beforePlayback)
+        assertTrue(
+            "playback ownership must suppress residual preload steering, requests=" +
+                afterPlayback.map(Request::offset),
+            afterPlayback.none { request -> request.offset >= 4_096L },
+        )
+
+        residual.close()
+        playback.close()
+        probe.close()
+        scope.cancel()
+    }
+
+    @Test
+    fun preloadOwnersStillDriveTheirOwnFileWithoutPlaybackOwnership() = runTest {
+        val scope = TestScope(StandardTestDispatcher(testScheduler))
+        val client = FakeFileClient()
+        val manager = TelegramFileManager(client, scope, privateFileReadable = { true })
+
+        val preload = manager.acquireRange(
+            fileId = 62,
+            offset = 0,
+            length = 256,
+            priority = TelegramFileRequestPriority.NEXT_PRELOAD,
+            ownerToken = "next-owner",
+            ownerKind = TelegramFileOwnerKind.NEXT_PRELOAD,
+            readAheadBytes = 256,
+        )
+        runCurrent()
+
+        assertTrue(
+            "a file without playback owners must still let the preload owner request data",
+            client.requests.any { request -> request.fileId == 62 && request.offset == 0L },
+        )
+
+        preload.close()
+        scope.cancel()
     }
 
     private fun snapshot(

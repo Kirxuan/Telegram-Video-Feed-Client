@@ -4,10 +4,6 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
@@ -18,63 +14,53 @@ import com.qixuan.channelvideoflow.feature.channels.ChannelSelectionRoute
 import com.qixuan.channelvideoflow.feature.settings.CacheSettingsRoute
 import com.qixuan.channelvideoflow.feature.tags.TagFilterRoute
 import com.qixuan.channelvideoflow.feature.video.VideoPlaybackRoute
-import com.qixuan.channelvideoflow.model.video.VideoFilter
 
 @Composable
 @UnstableApi
-fun ChannelVideoFlowNavHost(
+internal fun ChannelVideoFlowNavHost(
     authViewModel: AuthViewModel = hiltViewModel(),
+    navigationViewModel: AuthorizedNavigationViewModel = hiltViewModel(),
 ) {
     val authUiState by authViewModel.uiState.collectAsStateWithLifecycle()
-    var destination by rememberSaveable { mutableStateOf(AuthorizedDestination.CHANNELS) }
-    var playbackFilter by remember { mutableStateOf<VideoFilter?>(null) }
+    val navigation by navigationViewModel.state.collectAsStateWithLifecycle()
     LaunchedEffect(authUiState.step) {
         if (authUiState.step != LoginStep.AUTHORIZED) {
-            destination = AuthorizedDestination.CHANNELS
-            playbackFilter = null
+            navigationViewModel.reset()
         }
     }
     BackHandler(
         enabled = authUiState.step == LoginStep.AUTHORIZED &&
-            destination != AuthorizedDestination.CHANNELS,
+            navigation.destination != AuthorizedDestination.CHANNELS,
     ) {
-        destination = when (destination) {
-            AuthorizedDestination.FEED -> AuthorizedDestination.TAGS
-            AuthorizedDestination.TAGS,
-            AuthorizedDestination.SETTINGS,
-            -> AuthorizedDestination.CHANNELS
-            AuthorizedDestination.CHANNELS -> AuthorizedDestination.CHANNELS
-        }
+        navigationViewModel.back()
     }
     if (authUiState.step == LoginStep.AUTHORIZED) {
-        when (destination) {
+        when (navigation.destination) {
             AuthorizedDestination.SETTINGS -> CacheSettingsRoute(
-                onBack = { destination = AuthorizedDestination.CHANNELS },
+                onBack = navigationViewModel::back,
                 onLogout = {
-                    destination = AuthorizedDestination.CHANNELS
+                    navigationViewModel.reset()
                     authViewModel.logout()
                 },
             )
             AuthorizedDestination.TAGS -> TagFilterRoute(
-                onBack = { destination = AuthorizedDestination.CHANNELS },
-                onContinue = { filter ->
-                    playbackFilter = filter
-                    destination = AuthorizedDestination.FEED
-                },
+                onBack = navigationViewModel::back,
+                onContinue = navigationViewModel::openFeed,
             )
             AuthorizedDestination.FEED -> VideoPlaybackRoute(
-                initialFilter = playbackFilter,
-                onBack = { destination = AuthorizedDestination.TAGS },
+                initialFilter = navigation.filter,
+                initialOrder = navigation.order,
+                onOrderPersisted = navigationViewModel::updateOrder,
+                onBack = navigationViewModel::back,
                 onLogout = {
-                    destination = AuthorizedDestination.CHANNELS
-                    playbackFilter = null
+                    navigationViewModel.reset()
                     authViewModel.logout()
                 },
             )
             AuthorizedDestination.CHANNELS -> ChannelSelectionRoute(
                 onLogout = authViewModel::logout,
-                onOpenPlayback = { destination = AuthorizedDestination.TAGS },
-                onOpenCacheSettings = { destination = AuthorizedDestination.SETTINGS },
+                onOpenPlayback = navigationViewModel::openTags,
+                onOpenCacheSettings = navigationViewModel::openSettings,
                 logoutEnabled = authUiState.canLogout,
             )
         }
@@ -91,11 +77,4 @@ fun ChannelVideoFlowNavHost(
             onLogout = authViewModel::logout,
         )
     }
-}
-
-private enum class AuthorizedDestination {
-    CHANNELS,
-    TAGS,
-    FEED,
-    SETTINGS,
 }

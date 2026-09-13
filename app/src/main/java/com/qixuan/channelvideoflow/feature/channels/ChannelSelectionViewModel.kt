@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qixuan.channelvideoflow.domain.channel.TelegramChatRepository
 import com.qixuan.channelvideoflow.domain.message.TelegramMessageRepository
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservationFailure
 import com.qixuan.channelvideoflow.model.channel.TelegramChannel
 import com.qixuan.channelvideoflow.model.channel.TelegramChatFailure
 import com.qixuan.channelvideoflow.model.channel.TelegramChatSyncState
@@ -40,6 +41,7 @@ class ChannelSelectionViewModel @Inject constructor(
     private var floodWaitJob: Job? = null
     private var retrySecondsRemaining = 0
     private var scanProgress = emptyList<ChannelVideoScanProgress>()
+    private var scanObservationFailure: RepositoryObservationFailure? = null
     private var scanCountdownJob: Job? = null
     private var foregroundJob: Job? = null
 
@@ -69,8 +71,9 @@ class ChannelSelectionViewModel @Inject constructor(
             }
         }
         viewModelScope.launch {
-            messageRepository.scanProgress.collect { progress ->
-                scanProgress = progress
+            messageRepository.scanProgressObservation.collect { observation ->
+                scanProgress = observation.value
+                scanObservationFailure = observation.failure
                 restartScanCountdown()
                 rebuildUiState()
             }
@@ -220,6 +223,9 @@ class ChannelSelectionViewModel @Inject constructor(
             retrySecondsRemaining = retrySecondsRemaining,
             saveStatus = saveStatus,
             scanSummary = ChannelScanSummary(
+                duplicateVideoEncounterCount = scanProgress.sumOf(
+                    ChannelVideoScanProgress::duplicateVideoEncounterCount,
+                ),
                 processedVideoCandidateCount = scanProgress.sumOf(
                     ChannelVideoScanProgress::processedVideoCandidateCount,
                 ),
@@ -239,10 +245,18 @@ class ChannelSelectionViewModel @Inject constructor(
                 },
                 canControl = unfinished.isNotEmpty(),
                 retrySecondsRemaining = scanRetrySeconds,
-                failure = unfinished.firstNotNullOfOrNull(ChannelVideoScanProgress::failure),
+                failure = scanObservationFailure.toTelegramMessageFailure()
+                    ?: unfinished.firstNotNullOfOrNull(ChannelVideoScanProgress::failure),
             ),
         )
     }
+
+    private fun RepositoryObservationFailure?.toTelegramMessageFailure(): TelegramMessageFailure? =
+        when (this) {
+            RepositoryObservationFailure.DATABASE -> TelegramMessageFailure.Database
+            RepositoryObservationFailure.UNKNOWN -> TelegramMessageFailure.Unknown
+            null -> null
+        }
 
     private fun restartScanCountdown() {
         scanCountdownJob?.cancel()

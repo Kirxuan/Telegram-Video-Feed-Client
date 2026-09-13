@@ -129,6 +129,8 @@ data class AdaptivePreloadDecision(
     val recentP90Millis: Long?,
     /** Safe network class only; never contains an SSID, address, or other network identity. */
     val isUnmeteredWifi: Boolean = false,
+    /** User choice propagated to every preloader, including the standby player. */
+    val mobileDataPreloadEnabled: Boolean = false,
 )
 
 interface AdaptivePreloadController {
@@ -248,6 +250,19 @@ class AdaptivePreloadPolicyStateMachine(
     private fun evaluate(): AdaptivePreloadDecision {
         val hardReason = hardBlockedReason()
         if (hardReason != null) return decision(AdaptivePreloadState.OFF, hardReason)
+        // "Current has not rendered a first frame yet" degrades to the bounded conservative
+        // reserve instead of a hard block. Device evidence: a slow high-bitrate video can wait
+        // many seconds for its own startup reserve, and a hard block for that whole window
+        // meant the next item received zero preload bytes, so the following swipe was always a
+        // cold start. The conservative reserve is a single 256 KiB chunk whose TDLib priority
+        // (NEXT_PRELOAD) is below every current-playback priority, so it only consumes link
+        // capacity the playback stream is not using.
+        if (!currentHasFirstFrame) {
+            return decision(
+                AdaptivePreloadState.CONSERVATIVE,
+                AdaptivePreloadReason.CURRENT_NOT_STABLE,
+            )
+        }
         val recentP90 = recentP90Millis()
         if (recentP90 != null && recentP90 > SLOW_FIRST_FRAME_P90_MILLIS) {
             return decision(
@@ -294,7 +309,6 @@ class AdaptivePreloadPolicyStateMachine(
             return AdaptivePreloadReason.CONSECUTIVE_FAILURES
         }
         if (networkChangePending) return AdaptivePreloadReason.NETWORK_CHANGED
-        if (!currentHasFirstFrame) return AdaptivePreloadReason.CURRENT_NOT_STABLE
         if (rebuffering) return AdaptivePreloadReason.REBUFFER
         return null
     }
@@ -329,6 +343,7 @@ class AdaptivePreloadPolicyStateMachine(
         recentP90Millis = recentP90Millis(),
         isUnmeteredWifi = environment.signals.network == NetworkTransport.WIFI &&
             !environment.signals.isMetered,
+        mobileDataPreloadEnabled = environment.mobileDataEnabled,
     )
 
     companion object {
@@ -383,6 +398,18 @@ interface VideoPreloadController {
     fun updateCurrentPlaybackSafety(snapshot: NextPreloadSafetySnapshot) = Unit
 
     fun currentBudgetDecision(): NextPreloadBudgetDecision? = null
+
+    /**
+     * New-network bytes already charged to *this exact target* by this controller, including
+     * requests that were cancelled before they completed.
+     *
+     * The single next target can be served first by the lightweight byte stage and then by the
+     * playback pool. Without this hand-over the pool would start a fresh budget for the same
+     * target and could spend its full ceiling on top of the bytes the byte stage already asked
+     * for, breaking both the per-target request ceiling and "cancelling does not refund".
+     * Implementations that never share a target return 0.
+     */
+    fun requestedBytesFor(video: IndexedVideo): Long = 0L
 
     fun beginTargetPromotion()
 

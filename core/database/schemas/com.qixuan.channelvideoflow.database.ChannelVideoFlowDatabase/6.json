@@ -1,0 +1,468 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 6,
+    "identityHash": "41a783145711d29f86a630f334674dff",
+    "entities": [
+      {
+        "tableName": "channels",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chat_id` INTEGER NOT NULL, `title` TEXT NOT NULL, `username` TEXT, `is_selected` INTEGER NOT NULL, `is_pinned` INTEGER NOT NULL, `last_new_message_id` INTEGER, `oldest_scanned_message_id` INTEGER, `initial_scan_completed` INTEGER NOT NULL, `scan_strategy_version` INTEGER NOT NULL DEFAULT 2, `video_search_cursor` INTEGER NOT NULL DEFAULT 0, `video_search_completed` INTEGER NOT NULL DEFAULT 0, `video_candidate_count` INTEGER NOT NULL DEFAULT 0, `video_search_page_count` INTEGER NOT NULL DEFAULT 0, `approximate_video_count` INTEGER, `last_sync_time` INTEGER, `access_state` TEXT NOT NULL, `scan_state` TEXT NOT NULL, `scan_paused_by_user` INTEGER NOT NULL, `scan_retry_at` INTEGER, `scan_retry_count` INTEGER NOT NULL, `scan_failure_code` TEXT, `scan_failure_detail` INTEGER, `scanned_message_count` INTEGER NOT NULL, `scanned_page_count` INTEGER NOT NULL, `duplicate_video_encounter_count` INTEGER NOT NULL, `scan_exception_count` INTEGER NOT NULL, PRIMARY KEY(`chat_id`))",
+        "fields": [
+          {
+            "fieldPath": "chatId",
+            "columnName": "chat_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "username",
+            "columnName": "username",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "isSelected",
+            "columnName": "is_selected",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isPinned",
+            "columnName": "is_pinned",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastNewMessageId",
+            "columnName": "last_new_message_id",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "oldestScannedMessageId",
+            "columnName": "oldest_scanned_message_id",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "initialScanCompleted",
+            "columnName": "initial_scan_completed",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scanStrategyVersion",
+            "columnName": "scan_strategy_version",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "2"
+          },
+          {
+            "fieldPath": "videoSearchCursor",
+            "columnName": "video_search_cursor",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "videoSearchCompleted",
+            "columnName": "video_search_completed",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "videoCandidateCount",
+            "columnName": "video_candidate_count",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "videoSearchPageCount",
+            "columnName": "video_search_page_count",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
+          },
+          {
+            "fieldPath": "approximateVideoCount",
+            "columnName": "approximate_video_count",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "lastSyncTime",
+            "columnName": "last_sync_time",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "accessState",
+            "columnName": "access_state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scanState",
+            "columnName": "scan_state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scanPausedByUser",
+            "columnName": "scan_paused_by_user",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scanRetryAt",
+            "columnName": "scan_retry_at",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "scanRetryCount",
+            "columnName": "scan_retry_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scanFailureCode",
+            "columnName": "scan_failure_code",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "scanFailureDetail",
+            "columnName": "scan_failure_detail",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "scannedMessageCount",
+            "columnName": "scanned_message_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scannedPageCount",
+            "columnName": "scanned_page_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "duplicateVideoEncounterCount",
+            "columnName": "duplicate_video_encounter_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scanExceptionCount",
+            "columnName": "scan_exception_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "chat_id"
+          ]
+        }
+      },
+      {
+        "tableName": "videos",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chat_id` INTEGER NOT NULL, `message_id` INTEGER NOT NULL, `file_id` INTEGER NOT NULL, `remote_unique_id` TEXT NOT NULL, `caption` TEXT NOT NULL, `duration_seconds` INTEGER NOT NULL, `width` INTEGER NOT NULL, `height` INTEGER NOT NULL, `file_size` INTEGER, `supports_streaming` INTEGER NOT NULL, `publish_time` INTEGER NOT NULL, `edit_time` INTEGER, `can_be_saved` INTEGER NOT NULL, `is_deleted` INTEGER NOT NULL, `indexed_at` INTEGER NOT NULL, `invalidated_at` INTEGER, PRIMARY KEY(`chat_id`, `message_id`), FOREIGN KEY(`chat_id`) REFERENCES `channels`(`chat_id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "chatId",
+            "columnName": "chat_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messageId",
+            "columnName": "message_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fileId",
+            "columnName": "file_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "remoteUniqueId",
+            "columnName": "remote_unique_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "caption",
+            "columnName": "caption",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "durationSeconds",
+            "columnName": "duration_seconds",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "width",
+            "columnName": "width",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "height",
+            "columnName": "height",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fileSize",
+            "columnName": "file_size",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "supportsStreaming",
+            "columnName": "supports_streaming",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publishTime",
+            "columnName": "publish_time",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "editTime",
+            "columnName": "edit_time",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "canBeSaved",
+            "columnName": "can_be_saved",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "isDeleted",
+            "columnName": "is_deleted",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "indexedAt",
+            "columnName": "indexed_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "invalidatedAt",
+            "columnName": "invalidated_at",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "chat_id",
+            "message_id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_videos_chat_id",
+            "unique": false,
+            "columnNames": [
+              "chat_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_videos_chat_id` ON `${TABLE_NAME}` (`chat_id`)"
+          },
+          {
+            "name": "index_videos_publish_time_chat_id_message_id",
+            "unique": false,
+            "columnNames": [
+              "publish_time",
+              "chat_id",
+              "message_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_videos_publish_time_chat_id_message_id` ON `${TABLE_NAME}` (`publish_time`, `chat_id`, `message_id`)"
+          },
+          {
+            "name": "index_videos_is_deleted_invalidated_at",
+            "unique": false,
+            "columnNames": [
+              "is_deleted",
+              "invalidated_at"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_videos_is_deleted_invalidated_at` ON `${TABLE_NAME}` (`is_deleted`, `invalidated_at`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "channels",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "chat_id"
+            ],
+            "referencedColumns": [
+              "chat_id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "tags",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`normalized_name` TEXT NOT NULL, `canonical_display_name` TEXT NOT NULL, PRIMARY KEY(`normalized_name`))",
+        "fields": [
+          {
+            "fieldPath": "normalizedName",
+            "columnName": "normalized_name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "canonicalDisplayName",
+            "columnName": "canonical_display_name",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "normalized_name"
+          ]
+        }
+      },
+      {
+        "tableName": "video_tags",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chat_id` INTEGER NOT NULL, `message_id` INTEGER NOT NULL, `normalized_tag_name` TEXT NOT NULL, `display_name` TEXT NOT NULL, PRIMARY KEY(`chat_id`, `message_id`, `normalized_tag_name`), FOREIGN KEY(`chat_id`, `message_id`) REFERENCES `videos`(`chat_id`, `message_id`) ON UPDATE NO ACTION ON DELETE CASCADE , FOREIGN KEY(`normalized_tag_name`) REFERENCES `tags`(`normalized_name`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "chatId",
+            "columnName": "chat_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "messageId",
+            "columnName": "message_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "normalizedTagName",
+            "columnName": "normalized_tag_name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayName",
+            "columnName": "display_name",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "chat_id",
+            "message_id",
+            "normalized_tag_name"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_video_tags_chat_id_message_id",
+            "unique": false,
+            "columnNames": [
+              "chat_id",
+              "message_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_video_tags_chat_id_message_id` ON `${TABLE_NAME}` (`chat_id`, `message_id`)"
+          },
+          {
+            "name": "index_video_tags_normalized_tag_name",
+            "unique": false,
+            "columnNames": [
+              "normalized_tag_name"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_video_tags_normalized_tag_name` ON `${TABLE_NAME}` (`normalized_tag_name`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "videos",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "chat_id",
+              "message_id"
+            ],
+            "referencedColumns": [
+              "chat_id",
+              "message_id"
+            ]
+          },
+          {
+            "table": "tags",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "normalized_tag_name"
+            ],
+            "referencedColumns": [
+              "normalized_name"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "media_cache_entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`file_id` INTEGER NOT NULL, `cached_bytes` INTEGER NOT NULL, `last_accessed_at` INTEGER NOT NULL, PRIMARY KEY(`file_id`))",
+        "fields": [
+          {
+            "fieldPath": "fileId",
+            "columnName": "file_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cachedBytes",
+            "columnName": "cached_bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastAccessedAtMillis",
+            "columnName": "last_accessed_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "file_id"
+          ]
+        }
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '41a783145711d29f86a630f334674dff')"
+    ]
+  }
+}

@@ -1,5 +1,9 @@
 # VELORA（曜流）安全设计
 
+> Stage 25 候选补充：双池仍只有 ACTIVE 可请求音频焦点；C2 的 EGL 输出只用于可保存内容，受保护内容使用 C1。窗口保护同时覆盖当前 pager 内容与尚未退役的播放绑定，交接前同步设置安全标志。数据库加密作为独立的默认关闭候选：新空库生成 Keystore 封装密钥；旧库无密钥返回迁移必需；密钥/密文损坏失败关闭，不自动迁移、删除旧库或回退空密钥。Room 元数据尚未加密，不能把 TDLib 加密候选说成全库加密。验证边界见 [Stage 25 结果](STAGE25_OPTIMIZATION_RESULTS.md)。
+
+Stage 25 收尾仅操作 `emulator-5580 / CVF_STAGE25_API36_X86_64`，布局脚本校验完整 AVD 身份和 API 36 / x86_64；没有连接、探测、安装或操作实体手机。本次重新核验 release 的两项权限、备份禁用、native 白名单、凭证零命中与生产默认开关，结果和 APK 哈希见 [Stage 25 产物](STAGE25_ARTIFACTS.md)。R8 和 TDLib 加密 APK 只构建、不安装；静态检查不证明真实 Keystore、账号恢复或 16KiB ARM64 运行时兼容。
+
 文档版本：2.3
 日期：2026-09-02
 状态：Stage 24 已实现用户自行配置与 Android Keystore 加密存储；非 debug BuildConfig 空值、正式签名、APK 本机凭证零命中、权限/备份/ABI 审计已通过。仓库所有者报告当前版本真机正常使用通过；本次正式签名 APK 的设备安装和真实 Keystore instrumentation 未由 Codex 重复验证

@@ -100,7 +100,9 @@ class VideoPreloadManager private constructor(
     private var activeRangeReady = false
     private val activeChunkLeases = mutableListOf<TelegramFileRangeLease>()
     private var activeChunkLength = 0L
-    private var dynamicDownloadedNewBytes = 0L
+    private var dynamicRequestedBytes = 0L
+    private var dynamicCompletedBytes = 0L
+    private var ledgerTarget: Pair<com.qixuan.channelvideoflow.model.video.VideoKey, Int>? = null
     private var dynamicCachedCoveredBytes = 0L
     private var dynamicCanceledBytes = 0L
     private var skippedNextWastedBytes = 0L
@@ -119,11 +121,16 @@ class VideoPreloadManager private constructor(
 
     override fun currentBudgetDecision(): NextPreloadBudgetDecision? = synchronized(lock) {
         budgetDecision?.copy(
-            downloadedNewNetworkBytes = dynamicDownloadedNewBytes,
+            requestedUncachedBytes = dynamicRequestedBytes,
             cachedCoveredBytes = dynamicCachedCoveredBytes,
             canceledBytes = dynamicCanceledBytes,
             skippedNextWastedBytes = skippedNextWastedBytes,
         )
+    }
+
+    override fun requestedBytesFor(video: IndexedVideo): Long = synchronized(lock) {
+        if (ledgerTarget != video.key to video.playbackFileId) return@synchronized 0L
+        dynamicRequestedBytes
     }
 
     override fun updateCurrentPlaybackSafety(snapshot: NextPreloadSafetySnapshot) {
@@ -134,9 +141,10 @@ class VideoPreloadManager private constructor(
             val next = target?.let(::calculateBudgetLocked)
             budgetDecision = next
             if (
-                previous?.allowedBudgetTier != next?.allowedBudgetTier ||
-                previous?.calculatedTargetBytes != next?.calculatedTargetBytes ||
-                (next?.remainingNewNetworkBudgetBytes == 0L && activeChunkLength > 0L)
+                (next?.allowedBudgetTier == NextPreloadBudgetTier.BLOCKED &&
+                    previous?.allowedBudgetTier != NextPreloadBudgetTier.BLOCKED) ||
+                (preloadJob?.isActive != true && next != previous &&
+                    (next?.remainingNewNetworkBudgetBytes ?: 0L) > 0L)
             ) {
                 restartLocked()
             }
@@ -175,9 +183,14 @@ class VideoPreloadManager private constructor(
                         next.state == AdaptivePreloadState.OFF &&
                         next.reason.name in CLEAR_TARGET_REASONS
                     ) {
+                        val cleared = target
                         target = null
                         cancelSpeculativeLocked()
                         committedPromotion = null
+                        // Keep the published decision truthful after the target is dropped: the
+                        // device diagnostics read this value, and a stale tier would report the
+                        // stage as still admitted while nothing is being requested.
+                        budgetDecision = cleared?.let(::calculateBudgetLocked)
                         publishLocked(PreloadOwnerHandoffPhase.CANCELLED)
                         return@synchronized
                     }
@@ -197,7 +210,7 @@ class VideoPreloadManager private constructor(
                 return
             }
             if (dynamicNextPreloadEnabled && target != null && target?.key != safeTarget?.key) {
-                skippedNextWastedBytes = skippedNextWastedBytes.saturatedAdd(dynamicDownloadedNewBytes)
+                skippedNextWastedBytes = skippedNextWastedBytes.saturatedAdd(dynamicRequestedBytes)
             }
             committedPromotion = null
             samplePreloadController.cancelUnless(safeTarget)
@@ -302,6 +315,17 @@ class VideoPreloadManager private constructor(
         if (!ownerPromotionEnabled) {
             samplePreloadController.commitForPlayback(video)
             synchronized(lock) {
+                val pending = target
+                // A different item is still the one next target. The bounded byte prefix it holds
+                // must survive the current item's Loading snapshots, which arrive repeatedly while
+                // its first frame is pending; only the item that is itself becoming current has to
+                // release its speculative owner, because there a CURRENT_PLAYBACK owner takes over
+                // the same file and drives it (Stage 28 single-dominant window).
+                if (pending != null && pending.key != video.key) return
+                if (pending == null && activeLease == null) {
+                    budgetDecision = null
+                    return
+                }
                 cancelSpeculativeLocked()
                 target = null
                 budgetDecision = null
@@ -551,18 +575,27 @@ class VideoPreloadManager private constructor(
         val video = target
         if (video == null) {
             budgetDecision = null
-            dynamicDownloadedNewBytes = 0L
+            dynamicRequestedBytes = 0L
             dynamicCachedCoveredBytes = 0L
+            dynamicCompletedBytes = 0L
+            ledgerTarget = null
             if (hadSpeculativeOwner) publishLocked(PreloadOwnerHandoffPhase.RELEASED)
             return
         }
+        val identity = video.key to video.playbackFileId
+        val newTarget = ledgerTarget != identity
+        if (newTarget) {
+            ledgerTarget = identity
+            dynamicRequestedBytes = 0L
+            dynamicCompletedBytes = 0L
+            dynamicCanceledBytes = 0L
+        }
         val snapshot = gateway.currentSnapshot(video.playbackFileId)
-        dynamicCachedCoveredBytes = snapshot
+        if (newTarget) dynamicCachedCoveredBytes = snapshot
             ?.takeIf { it.downloadOffset == 0L }
             ?.downloadedPrefixSize
             ?.coerceAtLeast(0L)
             ?: 0L
-        dynamicDownloadedNewBytes = 0L
         val initialBudget = calculateBudgetLocked(video)
         budgetDecision = initialBudget
         val permitsHlsMetadata = initialBudget.allowedBudgetTier == NextPreloadBudgetTier.METADATA_ONLY &&
@@ -574,9 +607,16 @@ class VideoPreloadManager private constructor(
         }
         val generation = ++requestGeneration
         publishLocked(PreloadOwnerHandoffPhase.NEXT_WARMING, video)
+        // The lightweight startup stage is one bounded progressive byte prefix and nothing else.
+        // An HLS target needs a manifest plus segment ranges; requesting the manifest here would
+        // stack a second, uncharged request on top of the flat ceiling, and its failure path would
+        // add a further prefix on top of that. Both belong to the heavy preparation, which has its
+        // own duration-based budget. The prefix still helps an HLS promotion because Telegram's
+        // segments are byte ranges of the same media file.
+        val conservativeStartup = initialBudget.allowedBudgetTier == NextPreloadBudgetTier.CONSERVATIVE_STARTUP
         preloadJob = scope.launch {
             try {
-                val hlsPlan = if (video.hlsCapableVariants.isNotEmpty()) {
+                val hlsPlan = if (!conservativeStartup && video.hlsCapableVariants.isNotEmpty()) {
                     NextHlsPreloadManifestLoader.load(
                         video = video,
                         gateway = gateway,
@@ -593,7 +633,7 @@ class VideoPreloadManager private constructor(
                         if (hlsPlan != null) {
                             dynamicHlsPlan = hlsPlan
                             dynamicPreloadFileId = hlsPlan.mediaFileId
-                            dynamicCachedCoveredBytes = gateway.currentSnapshot(hlsPlan.mediaFileId)
+                            if (newTarget) dynamicCachedCoveredBytes = gateway.currentSnapshot(hlsPlan.mediaFileId)
                                 ?.takeIf { it.downloadOffset == 0L }
                                 ?.downloadedPrefixSize
                                 ?.coerceAtLeast(0L)
@@ -636,7 +676,7 @@ class VideoPreloadManager private constructor(
                             return@launch
                         }
                         val preloadFileId = dynamicPreloadFileId ?: video.playbackFileId
-                        val offset = dynamicCachedCoveredBytes.saturatedAdd(dynamicDownloadedNewBytes)
+                        val offset = dynamicCachedCoveredBytes.saturatedAdd(dynamicCompletedBytes)
                         val preloadFileSize = video.alternativeVariants
                             .firstOrNull { it.fileId == preloadFileId }
                             ?.fileSize
@@ -659,6 +699,9 @@ class VideoPreloadManager private constructor(
                             ownerKind = TelegramFileOwnerKind.NEXT_PRELOAD,
                             readAheadBytes = length,
                         )
+                        // Charge requested, uncached payload before waiting. Cancel/retry does
+                        // not erase the target's ledger and cannot reset its hard ceiling.
+                        dynamicRequestedBytes = dynamicRequestedBytes.saturatedAdd(length)
                         activeChunkLength = length
                         activeChunkLeases += lease
                         if (activeLease == null) activeLease = lease
@@ -668,7 +711,7 @@ class VideoPreloadManager private constructor(
                     synchronized(lock) {
                         if (requestGeneration != generation) return@synchronized
                         activeChunkLength = 0L
-                        dynamicDownloadedNewBytes = dynamicDownloadedNewBytes
+                        dynamicCompletedBytes = dynamicCompletedBytes
                             .saturatedAdd(request.length)
                             .coerceAtMost(NextPreloadBudgetController.ABSOLUTE_MAX_BYTES)
                         activeRangeReady = true
@@ -701,8 +744,17 @@ class VideoPreloadManager private constructor(
                 safety = currentSafety,
                 peakBitrateBitsPerSecond = conservativePeak,
                 cachedCoveredBytes = dynamicCachedCoveredBytes,
-                downloadedNewNetworkBytes = dynamicDownloadedNewBytes,
+                requestedUncachedBytes = dynamicRequestedBytes,
                 hlsBoundaries = dynamicHlsPlan?.boundaries.orEmpty(),
+                // This owner never binds a decoder, so while the current item has not rendered its
+                // first frame it degrades to the flat 256 KiB byte ceiling instead of a hard block.
+                // The pool standby builds its own input and keeps the strict admission.
+                lightweightStartupPrefetch = true,
+                // The dynamic path bypasses restartLocked's OFF check, and the safety snapshot
+                // cannot express an offline link or a network change. The policy decision is the
+                // only place that knows, so its hard block is reported explicitly and outranks
+                // every allowance below.
+                hasAdaptiveHardBlock = decision.state == AdaptivePreloadState.OFF,
             ),
         )
     }
@@ -712,7 +764,7 @@ class VideoPreloadManager private constructor(
             "calculatedTargetSeconds=${current.calculatedTargetSeconds} " +
                 "calculatedTargetBytes=${current.calculatedTargetBytes} " +
                 "allowedBudgetTier=${current.allowedBudgetTier} " +
-                "downloadedNewNetworkBytes=$dynamicDownloadedNewBytes " +
+                "requestedUncachedBytes=$dynamicRequestedBytes " +
                 "cachedCoveredBytes=$dynamicCachedCoveredBytes canceledBytes=$dynamicCanceledBytes " +
                 "skippedNextWastedBytes=$skippedNextWastedBytes " +
                 "currentBufferedSeconds=${current.currentBufferedSeconds} " +

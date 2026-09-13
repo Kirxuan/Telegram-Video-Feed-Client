@@ -6,6 +6,7 @@ import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
@@ -17,6 +18,7 @@ import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.click
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
@@ -35,6 +37,10 @@ import androidx.compose.ui.test.swipeUp
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.unit.dp
 import androidx.media3.ui.PlayerView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.qixuan.channelvideoflow.model.video.IndexedVideo
 import com.qixuan.channelvideoflow.model.video.VideoFeedOrder
@@ -58,6 +64,31 @@ import org.junit.runner.RunWith
 class VideoPlaybackScreenTest {
     @get:Rule
     val composeRule = createComposeRule()
+
+    @Test
+    fun largeOriginalPromptRequiresExplicitClickAndIdentifiesTheFile() {
+        val original = video(supportsStreaming = true).copy(fileSize = 300L * 1024 * 1024)
+        var confirmed: Pair<VideoKey, Int>? = null
+        composeRule.setContent {
+            VideoPlaybackScreen(
+                uiState = VideoPlaybackUiState(
+                    phase = VideoFeedPhase.CONTENT,
+                    items = listOf(FeedVideoItem(original, "测试频道")),
+                    originalPlaybackAwaitingConfirmation = original,
+                ),
+                onBack = {}, onLogout = {}, onRetry = {},
+                onConfirmOriginalPlayback = { key, fileId -> confirmed = key to fileId },
+                onTogglePause = {}, onSeek = {}, onToggleMute = {},
+                onOriginalMessage = {}, onOrderChanged = {}, onPageUnstable = {},
+                onPageSettled = { _, _ -> }, onAttachPlayer = {},
+            )
+        }
+        composeRule.onNodeWithText("此视频需要播放原画").assertIsDisplayed()
+        composeRule.onNodeWithText("也可以向上滑动，跳过此视频。").assertIsDisplayed()
+        assertEquals(null, confirmed)
+        composeRule.onNodeWithTag("video-original-confirm").performClick()
+        assertEquals(original.key to original.playbackFileId, confirmed)
+    }
 
     @Test
     fun playbackFailureUsesImmersiveChineseStateAndFakePlayerReceivesRetry() {
@@ -498,13 +529,31 @@ class VideoPlaybackScreenTest {
             )
         }
 
-        composeRule.onNodeWithTag(VideoFeedTestTags.Fullscreen).assertIsDisplayed().performClick()
+        val fullscreenButton = composeRule.onNodeWithTag(VideoFeedTestTags.Fullscreen)
+        fullscreenButton.assertIsDisplayed().assertHasClickAction()
+        val viewport = composeRule.onNodeWithTag(VideoFeedTestTags.Pager).getUnclippedBoundsInRoot()
+        val buttonBounds = fullscreenButton.getUnclippedBoundsInRoot()
+        assertTrue(
+            "Fullscreen action must fit inside the viewport: button=$buttonBounds viewport=$viewport",
+            buttonBounds.left >= viewport.left && buttonBounds.right <= viewport.right &&
+                buttonBounds.top >= viewport.top && buttonBounds.bottom <= viewport.bottom,
+        )
+        // Compare measured pixels: subtracting absolute dp coordinates can turn
+        // exactly 48dp into 47.99997dp at fractional display densities.
+        val minimumTouchHeightPx = with(composeRule.density) { 48.dp.roundToPx() }
+        val touchHeightPx = fullscreenButton.fetchSemanticsNode().size.height
+        assertTrue(
+            "Fullscreen touch target must be at least $minimumTouchHeightPx px; actual=$touchHeightPx",
+            touchHeightPx >= minimumTouchHeightPx,
+        )
+        fullscreenButton.performTouchInput { click() }
         assertTrue(fullscreenCallback)
         composeRule.onNodeWithTag(VideoFeedTestTags.ExitFullscreen).assertIsDisplayed()
         composeRule.onAllNodesWithTag(VideoFeedTestTags.Metadata).assertCountEquals(0)
         composeRule.onAllNodesWithTag(VideoFeedTestTags.Fullscreen).assertCountEquals(0)
-        composeRule.onNodeWithTag(VideoFeedTestTags.ExitFullscreen).performClick()
+        composeRule.onNodeWithTag(VideoFeedTestTags.ExitFullscreen).performTouchInput { click() }
         assertTrue(!fullscreenCallback)
+        composeRule.onNodeWithTag(VideoFeedTestTags.Fullscreen).assertIsDisplayed()
         composeRule.onNodeWithTag(VideoFeedTestTags.Metadata).assertIsDisplayed()
     }
 
@@ -1186,6 +1235,7 @@ class VideoPlaybackScreenTest {
 
         composeRule.runOnIdle { state = playingUiState(longCaption) }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
 
         composeRule.runOnIdle { state = playingUiState(anotherShort) }
@@ -1194,6 +1244,7 @@ class VideoPlaybackScreenTest {
 
         composeRule.runOnIdle { state = playingUiState(longTags) }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
     }
 
@@ -1224,6 +1275,7 @@ class VideoPlaybackScreenTest {
             }
         }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
 
         composeRule.runOnIdle {
@@ -1263,6 +1315,7 @@ class VideoPlaybackScreenTest {
             }
         }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
 
         composeRule.runOnIdle {
@@ -1302,6 +1355,7 @@ class VideoPlaybackScreenTest {
             }
         }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
 
         composeRule.runOnIdle { state = playingUiState(short) }
@@ -1347,6 +1401,7 @@ class VideoPlaybackScreenTest {
             }
         }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
 
         composeRule.runOnIdle { state = playingUiState(secondShort) }
@@ -1355,6 +1410,7 @@ class VideoPlaybackScreenTest {
 
         composeRule.runOnIdle { state = playingUiState(secondLong) }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
 
         composeRule.runOnIdle { state = playingUiState(firstShort) }
@@ -1394,6 +1450,7 @@ class VideoPlaybackScreenTest {
             )
         }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsCaption).assertTextEquals(oldCaption)
 
@@ -1449,6 +1506,7 @@ class VideoPlaybackScreenTest {
         }
         composeRule.waitForIdle()
 
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithText(caption).performClick()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsSheet).assertIsDisplayed()
         composeRule.onNodeWithText("视频详情").assertIsDisplayed()
@@ -1468,6 +1526,7 @@ class VideoPlaybackScreenTest {
             state = state.copy(player = state.player.copy(isPlaying = false, isPaused = true))
         }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsSheet).assertIsDisplayed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsClose).performClick()
@@ -1507,6 +1566,7 @@ class VideoPlaybackScreenTest {
                 onAttachPlayer = {},
             )
         }
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
 
         composeRule.runOnIdle { backDispatcher.onBackPressed() }
@@ -1553,16 +1613,19 @@ class VideoPlaybackScreenTest {
             }
         }
 
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.runOnIdle { state = playingUiState(second) }
         composeRule.waitForIdle()
         composeRule.onAllNodesWithTag(VideoFeedTestTags.DetailsSheet).assertCountEquals(0)
 
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.runOnIdle { state = state.copy(queueGeneration = 1L) }
         composeRule.waitForIdle()
         composeRule.onAllNodesWithTag(VideoFeedTestTags.DetailsSheet).assertCountEquals(0)
 
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.runOnIdle { state = state.copy(phase = VideoFeedPhase.EMPTY) }
         composeRule.waitForIdle()
@@ -1570,6 +1633,7 @@ class VideoPlaybackScreenTest {
 
         composeRule.runOnIdle { state = playingUiState(second) }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.runOnIdle { fullscreen = true }
         composeRule.waitForIdle()
@@ -1577,6 +1641,7 @@ class VideoPlaybackScreenTest {
 
         composeRule.runOnIdle { fullscreen = false }
         composeRule.waitForIdle()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.runOnIdle { showScreen = false }
         composeRule.waitForIdle()
@@ -1621,6 +1686,7 @@ class VideoPlaybackScreenTest {
                 onFullscreenChanged = { fullscreenCalls += 1 },
             )
         }
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.waitForIdle()
         composeRule.runOnIdle {
@@ -1660,6 +1726,10 @@ class VideoPlaybackScreenTest {
 
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsClose).performClick()
         composeRule.waitForIdle()
+        // The expanded description is an intentional overlay above the tap surface; collapse it
+        // before checking that the playback controls are reachable again.
+        composeRule.onNodeWithTag(VideoFeedTestTags.MetadataSummary).performClick()
+        composeRule.waitForIdle()
         composeRule.onNodeWithTag(VideoFeedTestTags.TapSurface).assertIsDisplayed()
         composeRule.onNodeWithTag(VideoFeedTestTags.Mute).assertIsDisplayed().performClick()
         composeRule.onNodeWithTag(VideoFeedTestTags.TapSurface).performClick()
@@ -1695,6 +1765,7 @@ class VideoPlaybackScreenTest {
             }
         }
 
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsCaption)
             .assertTextEquals(current.caption)
@@ -1734,6 +1805,7 @@ class VideoPlaybackScreenTest {
             }
         }
 
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.onNodeWithText("标签").assertIsDisplayed()
         composeRule.onAllNodesWithText("频道").assertCountEquals(0)
@@ -1849,6 +1921,41 @@ class VideoPlaybackScreenTest {
         assertEquals(1, fakePlayer.attachCalls)
         composeRule.onNodeWithTag(VideoFeedTestTags.Progress).assertIsDisplayed()
         composeRule.onAllNodesWithTag(VideoFeedTestTags.SwipeHint).assertCountEquals(1)
+    }
+
+    @Test
+    fun playingControlsAutoHideAndFirstTapRestoresWithoutTogglingPlayback() {
+        composeRule.mainClock.autoAdvance = false
+        val current = video(supportsStreaming = true)
+        var pauseCalls = 0
+        composeRule.setContent {
+            VideoPlaybackScreen(
+                uiState = playingUiState(current),
+                onBack = {},
+                onLogout = {},
+                onRetry = {},
+                onTogglePause = { pauseCalls += 1 },
+                onSeek = {},
+                onToggleMute = {},
+                onOriginalMessage = {},
+                onOrderChanged = {},
+                onPageUnstable = {},
+                onPageSettled = { _, _ -> },
+                onAttachPlayer = {},
+                autoHideControls = true,
+            )
+        }
+        composeRule.mainClock.advanceTimeByFrame()
+        composeRule.onNodeWithTag(VideoFeedTestTags.Mute).assertIsDisplayed()
+
+        composeRule.mainClock.advanceTimeBy(3_500L)
+        composeRule.waitForIdle()
+        composeRule.onAllNodesWithTag(VideoFeedTestTags.Mute).assertCountEquals(0)
+        composeRule.onNodeWithContentDescription("显示播放控制").performClick()
+        composeRule.mainClock.advanceTimeByFrame()
+
+        composeRule.onNodeWithTag(VideoFeedTestTags.Mute).assertIsDisplayed()
+        assertEquals(0, pauseCalls)
     }
 
     @Test
@@ -2620,6 +2727,7 @@ class VideoPlaybackScreenTest {
         composeRule.onNodeWithTag(VideoFeedTestTags.Mute).assertIsDisplayed()
         composeRule.onNodeWithTag(VideoFeedTestTags.OriginalLink).assertIsDisplayed()
         composeRule.onNodeWithTag(VideoFeedTestTags.Progress).assertIsDisplayed()
+        expandMetadataIfCollapsed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsSheet).assertIsDisplayed()
         composeRule.onNodeWithTag(VideoFeedTestTags.DetailsCaption)
@@ -2669,6 +2777,416 @@ class VideoPlaybackScreenTest {
         assertTrue(first != second)
     }
 
+    @Test
+    fun completionAdvancesExactlyOnePageThroughNormalPagerCallbacks() {
+        val first = video(true)
+        val second = first.copy(key = VideoKey(1, 2))
+        val third = first.copy(key = VideoKey(1, 3))
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT,
+            order = VideoFeedOrder.LATEST,
+            items = listOf(first, second, third).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        val settled = mutableListOf<Int>()
+        var unstable = 0
+        setPlaybackScreen({ state }, onPageUnstable = { unstable++ },
+            onPageSettled = { _, page -> settled += page })
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(1, settled.last())
+        assertTrue(unstable > 0)
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(isMuted = true)) }
+        composeRule.waitForIdle()
+        assertEquals(1, settled.last())
+        assertEquals(1, settled.count { it == 1 })
+        // The next real completion advances again, even though both keys share a chat.
+        composeRule.runOnIdle { state = state.copy(player = playingSnapshot(second)) }
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(2, settled.last())
+    }
+
+    @Test
+    fun completionWaitsForResumeAndLatestTailDoesNotWrap() {
+        val first = video(true)
+        val second = first.copy(key = VideoKey(2, 1))
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, second).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first).copy(hasEnded = true, isPaused = true, isPlaying = false),
+        ))
+        var settled = -1
+        setPlaybackScreen({ state }, onPageSettled = { _, page -> settled = page })
+        composeRule.waitForIdle()
+        assertEquals(0, settled)
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(isPaused = false)) }
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+        composeRule.runOnIdle { state = state.copy(player = playingSnapshot(second)) }
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+    }
+
+    @Test
+    fun completionFromOldBindingCannotAdvanceVisibleVideo() {
+        val first = video(true)
+        val other = first.copy(key = VideoKey(2, 1))
+        val state = VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, other).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(other).copy(hasEnded = true, isPlaying = false),
+        )
+        var settled = -1
+        setPlaybackScreen({ state }, onPageSettled = { _, page -> settled = page })
+        composeRule.waitForIdle()
+        assertEquals(0, settled)
+    }
+
+    @Test
+    fun reachingReportedDurationWithoutEndedDoesNotSkipVideo() {
+        val first = video(true)
+        val state = VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, first.copy(key = VideoKey(1, 2))).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first).copy(positionMillis = 60_000L, isPlaying = false),
+        )
+        var settled = -1
+        setPlaybackScreen({ state }, onPageSettled = { _, page -> settled = page })
+        composeRule.waitForIdle()
+        assertEquals(0, settled)
+    }
+
+    @Test
+    fun completionAdvancesInFullscreen() {
+        val first = video(true)
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, first.copy(key = VideoKey(1, 2))).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        var settled = -1
+        setPlaybackScreen({ state }, isFullscreen = true, onPageSettled = { _, page -> settled = page })
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+    }
+
+    @Test
+    fun randomCompletionUsesUpcomingRoundAtBoundary() {
+        val first = video(true)
+        val second = first.copy(key = VideoKey(1, 2))
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.RANDOM,
+            items = listOf(FeedVideoItem(first, "测试频道")),
+            upcomingItems = listOf(FeedVideoItem(second, "测试频道")),
+            player = playingSnapshot(first),
+        ))
+        var settled = -1
+        setPlaybackScreen({ state }, onPageSettled = { page, _ -> settled = page })
+        composeRule.waitForIdle()
+        val start = settled
+        composeRule.runOnIdle { state = state.copy(randomRoundStartPagerPage = start) }
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(start + 1, settled)
+        assertEquals(second.key, resolvePagerItem(state, settled)?.item?.video?.key)
+    }
+
+    @Test
+    fun completionWaitsUntilDetailsClose() {
+        val first = video(true, caption = overflowCaption("完整详情"))
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, first.copy(key = VideoKey(1, 2))).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        var settled = -1
+        setPlaybackScreen({ state }, onPageSettled = { _, page -> settled = page })
+        expandMetadataIfCollapsed()
+        composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).performClick()
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(0, settled)
+        composeRule.onNodeWithTag(VideoFeedTestTags.DetailsClose).performClick()
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+    }
+
+    @Test
+    fun completionDoesNotScrollWhileLifecycleStopped() {
+        val owner = object : LifecycleOwner {
+            override val lifecycle = LifecycleRegistry(this)
+        }
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.RESUMED }
+        val first = video(true)
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, first.copy(key = VideoKey(1, 2))).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        var settled = -1
+        setPlaybackScreen({ state }, lifecycleOwner = owner, onPageSettled = { _, page -> settled = page })
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.CREATED }
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(0, settled)
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.RESUMED }
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+        composeRule.runOnIdle {
+            owner.lifecycle.currentState = Lifecycle.State.CREATED
+            owner.lifecycle.currentState = Lifecycle.State.RESUMED
+        }
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+    }
+
+    @Test
+    fun completionWaitsForHeldPointerWithoutStealingGesture() {
+        val first = video(true)
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, first.copy(key = VideoKey(1, 2))).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        var settled = -1
+        setPlaybackScreen({ state }, onPageSettled = { _, page -> settled = page })
+        composeRule.onNodeWithTag(VideoFeedTestTags.Pager).performTouchInput { down(center) }
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(0, settled)
+        composeRule.onNodeWithTag(VideoFeedTestTags.Pager).performTouchInput { up() }
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+    }
+
+    @Test
+    fun cancelledPointerOnFullscreenChangeCannotBlockCompletion() {
+        val first = video(true)
+        var fullscreen by mutableStateOf(false)
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, first.copy(key = VideoKey(1, 2))).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        var settled = -1
+        composeRule.setContent {
+            VideoPlaybackScreen(
+                uiState = state, onBack = {}, onLogout = {}, onRetry = {},
+                onTogglePause = {}, onSeek = {}, onToggleMute = {}, onOriginalMessage = {},
+                onOrderChanged = {}, onPageUnstable = {},
+                onPageSettled = { _, page -> settled = page }, onAttachPlayer = {},
+                isFullscreen = fullscreen,
+            )
+        }
+        composeRule.onNodeWithTag(VideoFeedTestTags.Pager).performTouchInput { down(center) }
+        composeRule.runOnIdle { fullscreen = true }
+        composeRule.onNodeWithTag(VideoFeedTestTags.Pager).performTouchInput { up() }
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        composeRule.waitForIdle()
+        assertEquals(1, settled)
+    }
+
+    @Test
+    fun singleItemRandomRoundCanAdvanceOnEachFreshCompletion() {
+        val first = video(true)
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.RANDOM,
+            items = listOf(FeedVideoItem(first, "测试频道")),
+            player = playingSnapshot(first),
+        ))
+        var settled = -1
+        setPlaybackScreen({ state }, onPageSettled = { page, _ -> settled = page })
+        composeRule.waitForIdle()
+        val start = settled
+        repeat(2) { round ->
+            composeRule.runOnIdle { state = state.copy(player = playingSnapshot(first)) }
+            composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+            composeRule.waitForIdle()
+            assertEquals(start + round + 1, settled)
+        }
+    }
+
+    @Test
+    fun lifecycleInterruptionMidAdvanceFinishesTheSameTransitionOnResume() {
+        val first = video(true)
+        val second = first.copy(key = VideoKey(1, 2))
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, second).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        val owner = object : LifecycleOwner {
+            override val lifecycle = LifecycleRegistry(this)
+        }
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.RESUMED }
+        var pagerState: androidx.compose.foundation.pager.PagerState? = null
+        val settled = mutableListOf<Int>()
+        setPlaybackScreen(
+            { state },
+            lifecycleOwner = owner,
+            onPageSettled = { _, page -> settled += page },
+            onPagerState = { pagerState = it },
+        )
+        composeRule.mainClock.autoAdvance = false
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        driveUntilAdvanceAnimationIsRunning { pagerState }
+        // Interrupt before the snap midpoint: the device probe shows the pager stops exactly
+        // here, between pages, and never settles by itself.
+        composeRule.mainClock.advanceTimeBy(60L)
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.CREATED }
+        composeRule.mainClock.advanceTimeBy(500L)
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.RESUMED }
+        composeRule.mainClock.advanceTimeBy(2_000L)
+        composeRule.mainClock.autoAdvance = true
+        composeRule.waitForIdle()
+
+        assertEquals(1, settled.lastOrNull() ?: -1)
+        val pager = requireNotNull(pagerState)
+        composeRule.runOnIdle {
+            assertEquals(1, pager.settledPage)
+            assertEquals(
+                "an interrupted advance must not strand the pager mid-scroll",
+                0f,
+                pager.currentPageOffsetFraction,
+                0.01f,
+            )
+        }
+    }
+
+    @Test
+    fun lifecycleInterruptionAfterSnapMidpointSettlesTheAdvanceWithoutSkipping() {
+        val first = video(true)
+        val second = first.copy(key = VideoKey(1, 2))
+        val third = first.copy(key = VideoKey(1, 3))
+        var state by mutableStateOf(VideoPlaybackUiState(
+            phase = VideoFeedPhase.CONTENT, order = VideoFeedOrder.LATEST,
+            items = listOf(first, second, third).map { FeedVideoItem(it, "测试频道") },
+            player = playingSnapshot(first),
+        ))
+        val owner = object : LifecycleOwner {
+            override val lifecycle = LifecycleRegistry(this)
+        }
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.RESUMED }
+        var pagerState: androidx.compose.foundation.pager.PagerState? = null
+        val settled = mutableListOf<Int>()
+        setPlaybackScreen(
+            { state },
+            lifecycleOwner = owner,
+            onPageSettled = { _, page -> settled += page },
+            onPagerState = { pagerState = it },
+        )
+        composeRule.mainClock.autoAdvance = false
+        composeRule.runOnIdle { state = state.copy(player = state.player.copy(hasEnded = true, isPlaying = false)) }
+        driveUntilAdvanceAnimationIsRunning { pagerState }
+        // Interrupt after the snap midpoint: the pager already reports the next page but is
+        // still fractionally offset; the retry must settle page 1, never skip to page 2.
+        composeRule.mainClock.advanceTimeBy(240L)
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.CREATED }
+        composeRule.mainClock.advanceTimeBy(500L)
+        composeRule.runOnIdle { owner.lifecycle.currentState = Lifecycle.State.RESUMED }
+        composeRule.mainClock.advanceTimeBy(2_000L)
+        composeRule.mainClock.autoAdvance = true
+        composeRule.waitForIdle()
+
+        assertEquals(1, settled.lastOrNull() ?: -1)
+        val pager = requireNotNull(pagerState)
+        composeRule.runOnIdle {
+            assertEquals(1, pager.settledPage)
+            assertEquals(
+                "the resumed attempt must settle the anchored target page",
+                0f,
+                pager.currentPageOffsetFraction,
+                0.01f,
+            )
+        }
+    }
+
+    /**
+     * Drives the manual test clock frame by frame until the auto-advance animation is really
+     * scrolling, so interruption tests hit the animation instead of the wait phase.
+     */
+    private fun driveUntilAdvanceAnimationIsRunning(
+        pager: () -> androidx.compose.foundation.pager.PagerState?,
+    ) {
+        var attempts = 0
+        var scrolling = false
+        while (!scrolling && attempts < 120) {
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.runOnIdle { scrolling = pager()?.isScrollInProgress == true }
+            attempts++
+        }
+        assertTrue("auto-advance animation never started scrolling", scrolling)
+    }
+
+    @Test
+    fun descriptionBarStartsCollapsedAndOneTapRevealsTheFullMetadata() {
+        val caption = overflowCaption("默认收起的简介")
+        val current = video(supportsStreaming = true, caption = caption)
+        setPlaybackScreen(uiState = { playingUiState(current) })
+        composeRule.waitForIdle()
+
+        // Collapsed by default: the one-line summary exists, the full text block is not mounted.
+        composeRule.onNodeWithTag(VideoFeedTestTags.Metadata).assertIsDisplayed()
+        composeRule.onNodeWithTag(VideoFeedTestTags.MetadataSummary).assertIsDisplayed()
+        composeRule.onAllNodesWithTag(VideoFeedTestTags.DetailsExpand).assertCountEquals(0)
+        composeRule.onAllNodesWithText(caption).assertCountEquals(0)
+
+        composeRule.onNodeWithTag(VideoFeedTestTags.MetadataSummary).performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText(caption).assertIsDisplayed()
+        composeRule.onNodeWithTag(VideoFeedTestTags.DetailsExpand).assertIsDisplayed()
+
+        composeRule.onNodeWithTag(VideoFeedTestTags.MetadataSummary).performClick()
+        composeRule.waitForIdle()
+        composeRule.onAllNodesWithText(caption).assertCountEquals(0)
+        composeRule.onNodeWithTag(VideoFeedTestTags.MetadataSummary).assertIsDisplayed()
+    }
+
+    @Test
+    fun progressBarClearsTheBottomGestureStripAndTheDescriptionBar() {
+        val current = video(supportsStreaming = true, caption = "底部布局校验")
+        setPlaybackScreen(uiState = { playingUiState(current) })
+        composeRule.waitForIdle()
+
+        val pager = composeRule.onNodeWithTag(VideoFeedTestTags.Pager).getUnclippedBoundsInRoot()
+        val progress = composeRule.onNodeWithTag(VideoFeedTestTags.Progress)
+            .getUnclippedBoundsInRoot()
+        val metadata = composeRule.onNodeWithTag(VideoFeedTestTags.Metadata)
+            .getUnclippedBoundsInRoot()
+        val trackCenter = (progress.top + progress.bottom) / 2
+
+        assertTrue(
+            "Progress touch area must stay clear of the bottom edge: progress=$progress pager=$pager",
+            pager.bottom - progress.bottom >= 30.dp,
+        )
+        assertTrue(
+            "Progress track must sit above the gesture strip: center=$trackCenter pager=$pager",
+            pager.bottom - trackCenter >= 46.dp,
+        )
+        assertTrue(
+            "Progress must not overlap the description bar: progress=$progress metadata=$metadata",
+            progress.top >= metadata.bottom,
+        )
+    }
+
+    /**
+     * The description panel is collapsed by default and expansion is scoped to one video, so every
+     * interaction with the in-panel "展开" affordance first opens the panel when it is closed.
+     */
+    private fun expandMetadataIfCollapsed() {
+        val collapsed = composeRule
+            .onAllNodesWithContentDescription("展开视频简介")
+            .fetchSemanticsNodes()
+            .isNotEmpty()
+        if (collapsed) {
+            composeRule.onNodeWithTag(VideoFeedTestTags.MetadataSummary).performClick()
+            composeRule.waitForIdle()
+        }
+    }
+
     private fun setPlaybackScreen(
         uiState: () -> VideoPlaybackUiState,
         onTogglePause: () -> Unit = {},
@@ -2682,8 +3200,11 @@ class VideoPlaybackScreenTest {
         onAttachPlayer: (PlayerView) -> Unit = {},
         onDetachPlayer: (PlayerView) -> Unit = {},
         isFullscreen: Boolean = false,
+        lifecycleOwner: LifecycleOwner? = null,
+        onPagerState: ((androidx.compose.foundation.pager.PagerState) -> Unit)? = null,
     ) {
         composeRule.setContent {
+            CompositionLocalProvider(LocalLifecycleOwner provides (lifecycleOwner ?: LocalLifecycleOwner.current)) {
             VideoPlaybackScreen(
                 uiState = uiState(),
                 onBack = {},
@@ -2703,7 +3224,9 @@ class VideoPlaybackScreenTest {
                 onAttachPlayer = onAttachPlayer,
                 onDetachPlayer = onDetachPlayer,
                 isFullscreen = isFullscreen,
+                onPagerState = onPagerState,
             )
+            }
         }
     }
 

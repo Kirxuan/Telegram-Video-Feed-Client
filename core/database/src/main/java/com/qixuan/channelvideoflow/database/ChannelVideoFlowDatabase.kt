@@ -12,7 +12,7 @@ import androidx.room.TypeConverters
         VideoTagCrossRef::class,
         MediaCacheEntryEntity::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 @TypeConverters(ChannelConverters::class)

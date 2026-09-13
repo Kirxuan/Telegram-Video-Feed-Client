@@ -26,6 +26,10 @@ fun telegramProperty(name: String): String =
 fun String.asBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
+val r8CandidateEnabled = providers.gradleProperty("cvfR8CandidateEnabled")
+    .map(String::toBooleanStrict)
+    .orElse(false)
+
 android {
     namespace = "com.qixuan.channelvideoflow"
 
@@ -39,8 +43,8 @@ android {
         applicationId = "com.qixuan.channelvideoflow"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -56,8 +60,22 @@ android {
             matchingFallbacks += listOf("debug")
         }
 
+        create("benchmark") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+            isDebuggable = false
+            isMinifyEnabled = r8CandidateEnabled.get()
+            isShrinkResources = r8CandidateEnabled.get()
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+
         release {
             isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -117,6 +135,16 @@ androidComponents {
 kotlin {
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
+    }
+}
+
+composeCompiler {
+    val reportsEnabled = providers.gradleProperty("cvfComposeCompilerReports")
+        .map(String::toBooleanStrict)
+        .orElse(false)
+    if (reportsEnabled.get()) {
+        reportsDestination.set(layout.buildDirectory.dir("compose-compiler/reports"))
+        metricsDestination.set(layout.buildDirectory.dir("compose-compiler/metrics"))
     }
 }
 

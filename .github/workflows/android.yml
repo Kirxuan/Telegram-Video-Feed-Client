@@ -1,0 +1,67 @@
+name: Android host proof
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-proof:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      GRADLE_OPTS: -Dorg.gradle.dependency.verification=strict -Dfile.encoding=UTF-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: gradle/actions/wrapper-validation@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install stable Android SDK inputs
+        shell: pwsh
+        run: |
+          sdkmanager 'platforms;android-36.1' 'build-tools;36.0.0'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Script contract tests
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts/tests/*.Tests.ps1 | ForEach-Object { & $_.FullName }
+
+      - name: Full host gate (single worker for Lint FIR stability)
+        shell: pwsh
+        run: |
+          .\gradlew.bat test lint assembleDebug :app:assembleRelease :app:compileInstrumentationKotlin :app:testInstrumentationUnitTest :core:database:compileDebugAndroidTestKotlin --dependency-verification=strict --max-workers=1 --no-daemon --console=plain
+
+      - name: Release boundary proof
+        shell: pwsh
+        run: |
+          .\scripts\verify-stage25-release-boundaries.ps1
+
+      - name: Native ELF and APK 16 KiB static proof
+        shell: pwsh
+        run: |
+          python scripts/verify-native-pages.py app/build/outputs/apk/release/app-release-unsigned.apk --output build/reports/stage25-experiments/native-pages.json
+
+      - name: Upload non-sensitive reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-host-proof
+          path: |
+            app/build/reports/lint-results-*.html
+            build/reports/stage25k/release-boundaries/*
+            build/reports/stage25-experiments/native-pages.json
+          if-no-files-found: warn

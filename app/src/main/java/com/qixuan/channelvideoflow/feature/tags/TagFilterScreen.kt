@@ -1,7 +1,5 @@
 package com.qixuan.channelvideoflow.feature.tags
 
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +14,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Checkbox
@@ -28,6 +27,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -40,6 +42,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.toggleableState
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -66,8 +69,10 @@ internal object TagFilterTestTags {
     const val Continue = "tag-filter-continue"
     const val Loading = "tag-filter-loading"
     const val NoResults = "tag-filter-no-results"
+    const val Error = "tag-filter-error"
     const val List = "tag-filter-list"
     fun tag(name: String) = "tag-filter-$name"
+    fun expand(name: String) = "tag-filter-expand-$name"
 }
 
 @Composable
@@ -85,6 +90,7 @@ fun TagFilterRoute(
         onTagToggle = viewModel::toggleTag,
         onModeChanged = viewModel::setMode,
         onClearSelection = viewModel::clearSelection,
+        onRetryObservation = viewModel::retryObservation,
         onContinue = { onContinue(viewModel.currentFilter()) },
     )
 }
@@ -99,34 +105,51 @@ internal fun TagFilterScreen(
     onContinue: () -> Unit,
     onSearchQueryChanged: (String) -> Unit = {},
     onClearSearch: () -> Unit = {},
+    onRetryObservation: () -> Unit = {},
 ) {
     val totalTagCount = uiState.totalTagCount.takeIf { it > 0 } ?: uiState.tags.size
-    val stateScrollState = rememberScrollState()
+    val bodyState = when {
+        uiState.isLoading -> TagBodyState.Loading
+        uiState.channelIds.isEmpty() -> TagBodyState.MissingChannels
+        uiState.observationFailure != null && uiState.tags.isEmpty() -> TagBodyState.Error
+        uiState.hasActiveSearch && uiState.tags.isEmpty() && totalTagCount > 0 ->
+            TagBodyState.NoResults
+        totalTagCount == 0 -> TagBodyState.Empty
+        else -> TagBodyState.Content
+    }
     PremiumBackdrop {
         Scaffold(
             containerColor = Color.Transparent,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
-                PremiumTopBar(
-                    title = stringResource(R.string.tags_title),
-                    modifier = Modifier.windowInsetsPadding(
-                        WindowInsets.safeDrawing.only(
-                            WindowInsetsSides.Horizontal + WindowInsetsSides.Top,
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .windowInsetsPadding(
+                            WindowInsets.safeDrawing.only(
+                                WindowInsetsSides.Horizontal + WindowInsetsSides.Top,
+                            ),
                         ),
-                    ),
-                    navigation = {
-                        IconButton(
-                            onClick = onBack,
-                            modifier = Modifier.testTag(TagFilterTestTags.Back),
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_arrow_back_outlined),
-                                contentDescription = stringResource(R.string.tags_back),
-                                modifier = Modifier.size(ChannelVideoFlowTokens.Sizes.icon),
-                            )
-                        }
-                    },
-                )
+                ) {
+                    PremiumTopBar(
+                        title = stringResource(R.string.tags_title),
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .widthIn(max = RESPONSIVE_CONTENT_MAX_WIDTH),
+                        navigation = {
+                            IconButton(
+                                onClick = onBack,
+                                modifier = Modifier.testTag(TagFilterTestTags.Back),
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_arrow_back_outlined),
+                                    contentDescription = stringResource(R.string.tags_back),
+                                    modifier = Modifier.size(ChannelVideoFlowTokens.Sizes.icon),
+                                )
+                            }
+                        },
+                    )
+                }
             },
             bottomBar = {
                 BottomPrimaryAction(
@@ -143,102 +166,85 @@ internal fun TagFilterScreen(
                 )
             },
         ) { innerPadding ->
-            Column(
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(innerPadding)
-                    .padding(horizontal = ChannelVideoFlowTokens.Spacing.large),
-                verticalArrangement = Arrangement.spacedBy(ChannelVideoFlowTokens.Spacing.small),
+                    .padding(innerPadding),
             ) {
-                GlossSearchField(
-                    value = uiState.searchQuery,
-                    onValueChange = onSearchQueryChanged,
-                    label = stringResource(R.string.tags_search),
-                    searchIcon = painterResource(R.drawable.ic_search_outlined),
-                    searchIconContentDescription = stringResource(R.string.tags_search_icon),
-                    clearIcon = painterResource(R.drawable.ic_clear_outlined),
-                    clearIconContentDescription = stringResource(R.string.tags_search_clear),
-                    modifier = Modifier.testTag(TagFilterTestTags.Search),
-                    clearButtonModifier = Modifier.testTag(TagFilterTestTags.ClearSearch),
-                )
-                Text(
-                    text = stringResource(R.string.tags_match_summary),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                SegmentedControl(
-                    options = listOf(
-                        stringResource(R.string.tags_mode_any),
-                        stringResource(R.string.tags_mode_all),
+                LazyColumn(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxSize()
+                        .widthIn(max = RESPONSIVE_CONTENT_MAX_WIDTH)
+                        .testTag(TagFilterTestTags.List),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        start = ChannelVideoFlowTokens.Spacing.large,
+                        end = ChannelVideoFlowTokens.Spacing.large,
+                        bottom = ChannelVideoFlowTokens.Spacing.small,
                     ),
-                    selectedIndex = if (uiState.mode == TagFilterMode.OR) 0 else 1,
-                    onSelected = { index ->
-                        onModeChanged(if (index == 0) TagFilterMode.OR else TagFilterMode.AND)
-                    },
-                    modifier = Modifier.testTag(TagFilterTestTags.Mode),
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalArrangement = Arrangement.spacedBy(
+                        ChannelVideoFlowTokens.Spacing.small,
+                    ),
                 ) {
-                    StatusPill(
-                        text = stringResource(
-                            R.string.tags_selected_count,
-                            uiState.selectedNames.size,
-                        ),
-                    )
-                    if (uiState.hasActiveSearch) {
+                    item(key = "search") {
+                        GlossSearchField(
+                            value = uiState.searchQuery,
+                            onValueChange = onSearchQueryChanged,
+                            label = stringResource(R.string.tags_search),
+                            searchIcon = painterResource(R.drawable.ic_search_outlined),
+                            searchIconContentDescription = stringResource(R.string.tags_search_icon),
+                            clearIcon = painterResource(R.drawable.ic_clear_outlined),
+                            clearIconContentDescription = stringResource(R.string.tags_search_clear),
+                            modifier = Modifier.testTag(TagFilterTestTags.Search),
+                            clearButtonModifier = Modifier.testTag(TagFilterTestTags.ClearSearch),
+                        )
+                    }
+                    item(key = "match-summary") {
                         Text(
-                            text = stringResource(
-                                R.string.tags_visible_count,
-                                uiState.tags.size,
-                                totalTagCount,
-                            ),
-                            modifier = Modifier.weight(1f),
+                            text = stringResource(R.string.tags_match_summary),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall,
-                            maxLines = 1,
                         )
-                    } else {
-                        Box(modifier = Modifier.weight(1f))
                     }
-                    TextButton(
-                        onClick = onClearSelection,
-                        enabled = uiState.selectedNames.isNotEmpty(),
-                        modifier = Modifier.testTag(TagFilterTestTags.ClearSelection),
-                    ) {
-                        Text(stringResource(R.string.tags_clear_selection))
+                    item(key = "mode") {
+                        SegmentedControl(
+                            options = listOf(
+                                stringResource(R.string.tags_mode_any),
+                                stringResource(R.string.tags_mode_all),
+                            ),
+                            selectedIndex = if (uiState.mode == TagFilterMode.OR) 0 else 1,
+                            onSelected = { index ->
+                                onModeChanged(if (index == 0) TagFilterMode.OR else TagFilterMode.AND)
+                            },
+                            modifier = Modifier.testTag(TagFilterTestTags.Mode),
+                        )
                     }
-                }
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth(),
-                ) {
-                    val bodyState = when {
-                        uiState.isLoading -> TagBodyState.Loading
-                        uiState.channelIds.isEmpty() -> TagBodyState.MissingChannels
-                        uiState.hasActiveSearch && uiState.tags.isEmpty() && totalTagCount > 0 ->
-                            TagBodyState.NoResults
-                        totalTagCount == 0 -> TagBodyState.Empty
-                        else -> TagBodyState.Content
+                    item(key = "selection-summary") {
+                        TagSelectionSummary(
+                            selectedCount = uiState.selectedNames.size,
+                            visibleCount = uiState.tags.size,
+                            totalCount = totalTagCount,
+                            hasActiveSearch = uiState.hasActiveSearch,
+                            hasObservationFailure = uiState.observationFailure != null,
+                            onClearSelection = onClearSelection,
+                            onRetryObservation = onRetryObservation,
+                        )
                     }
                     when (bodyState) {
-                        TagBodyState.Loading -> {
+                        TagBodyState.Loading -> item(key = "loading") {
+                            Box(
+                                modifier = Modifier.fillMaxWidth().sizeIn(minHeight = 200.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
                             CircularProgressIndicator(
-                                modifier = Modifier
-                                    .align(Alignment.Center)
-                                    .testTag(TagFilterTestTags.Loading),
+                                    modifier = Modifier.testTag(TagFilterTestTags.Loading),
                             )
                         }
-                        TagBodyState.MissingChannels -> {
+                        }
+                        TagBodyState.MissingChannels -> item(key = "missing-channels") {
                             StatePanel(
                                 title = stringResource(R.string.tags_missing_channels_title),
                                 message = stringResource(R.string.tags_missing_channels_message),
-                                modifier = Modifier
-                                    .align(Alignment.Center)
-                                    .verticalScroll(stateScrollState),
                                 action = {
                                     TextButton(onClick = onBack) {
                                         Text(stringResource(R.string.tags_return_channels))
@@ -246,14 +252,11 @@ internal fun TagFilterScreen(
                                 },
                             )
                         }
-                        TagBodyState.NoResults -> {
+                        TagBodyState.NoResults -> item(key = "no-results") {
                             StatePanel(
                                 title = stringResource(R.string.tags_no_results_title),
                                 message = stringResource(R.string.tags_no_results_message),
-                                modifier = Modifier
-                                    .align(Alignment.Center)
-                                    .verticalScroll(stateScrollState)
-                                    .testTag(TagFilterTestTags.NoResults),
+                                modifier = Modifier.testTag(TagFilterTestTags.NoResults),
                                 action = {
                                     TextButton(onClick = onClearSearch) {
                                         Text(stringResource(R.string.tags_search_clear))
@@ -261,16 +264,30 @@ internal fun TagFilterScreen(
                                 },
                             )
                         }
-                        TagBodyState.Empty -> {
+                        TagBodyState.Empty -> item(key = "empty") {
                             StatePanel(
                                 title = stringResource(R.string.tags_empty_title),
                                 message = stringResource(R.string.tags_empty_message),
-                                modifier = Modifier
-                                    .align(Alignment.Center)
-                                    .verticalScroll(stateScrollState),
                             )
                         }
-                        TagBodyState.Content -> TagList(uiState.tags, onTagToggle)
+                        TagBodyState.Error -> item(key = "error") {
+                            StatePanel(
+                                title = stringResource(R.string.tags_database_error_title),
+                                message = stringResource(R.string.tags_database_error_message),
+                                modifier = Modifier.testTag(TagFilterTestTags.Error),
+                                action = {
+                                    TextButton(onClick = onRetryObservation) {
+                                        Text(stringResource(R.string.tags_retry))
+                                    }
+                                },
+                            )
+                        }
+                        TagBodyState.Content -> items(
+                            items = uiState.tags,
+                            key = { item -> item.summary.normalizedName },
+                        ) { item ->
+                            TagRow(item = item, onTagToggle = onTagToggle)
+                        }
                     }
                 }
             }
@@ -279,19 +296,68 @@ internal fun TagFilterScreen(
 }
 
 @Composable
-private fun TagList(
-    tags: List<TagFilterItem>,
+private fun TagSelectionSummary(
+    selectedCount: Int,
+    visibleCount: Int,
+    totalCount: Int,
+    hasActiveSearch: Boolean,
+    hasObservationFailure: Boolean,
+    onClearSelection: () -> Unit,
+    onRetryObservation: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            StatusPill(text = stringResource(R.string.tags_selected_count, selectedCount))
+            if (hasActiveSearch) {
+                Text(
+                    text = stringResource(R.string.tags_visible_count, visibleCount, totalCount),
+                    modifier = Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            TextButton(
+                onClick = onClearSelection,
+                enabled = selectedCount > 0,
+                modifier = Modifier.testTag(TagFilterTestTags.ClearSelection),
+            ) {
+                Text(stringResource(R.string.tags_clear_selection))
+            }
+            if (hasObservationFailure) {
+                TextButton(onClick = onRetryObservation) {
+                    Text(stringResource(R.string.tags_retry))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TagRow(
+    item: TagFilterItem,
     onTagToggle: (String) -> Unit,
 ) {
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .testTag(TagFilterTestTags.List),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        items(tags, key = { item -> item.summary.normalizedName }) { item ->
-            GlossCard(
+            var expanded by rememberSaveable(item.summary.normalizedName) { mutableStateOf(false) }
+            var canExpand by rememberSaveable(item.summary.normalizedName) { mutableStateOf(false) }
+            val shouldOfferExpansion = canExpand || item.summary.displayName.length > 28
+            val selectedState = stringResource(
+                if (item.isSelected) R.string.tags_selected else R.string.tags_not_selected,
+            )
+            Column(modifier = Modifier.fillMaxWidth()) {
+                GlossCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .semantics {
@@ -311,40 +377,59 @@ private fun TagList(
                 selected = item.isSelected,
                 onClick = { onTagToggle(item.summary.normalizedName) },
                 role = Role.Checkbox,
-                stateDescription = if (item.isSelected) "已选择" else "未选择",
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                stateDescription = selectedState,
                 ) {
-                    Checkbox(checked = item.isSelected, onCheckedChange = null)
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .padding(end = 8.dp),
-                        verticalArrangement = Arrangement.spacedBy(1.dp),
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        Checkbox(checked = item.isSelected, onCheckedChange = null)
                         Text(
                             text = item.summary.displayName,
-                            maxLines = 2,
+                            modifier = Modifier.weight(1f),
+                            maxLines = if (expanded) Int.MAX_VALUE else 2,
                             overflow = TextOverflow.Ellipsis,
                             style = MaterialTheme.typography.bodyLarge,
+                            onTextLayout = { result ->
+                                if (result.hasVisualOverflow) canExpand = true
+                            },
                         )
                         Text(
                             text = stringResource(
                                 R.string.tags_video_count,
                                 item.summary.videoCount,
                             ),
+                            modifier = Modifier.widthIn(min = 64.dp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall,
+                            textAlign = TextAlign.End,
                             maxLines = 1,
                         )
                     }
                 }
+                if (shouldOfferExpansion) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        TextButton(
+                            onClick = { expanded = !expanded },
+                            modifier = Modifier
+                                .sizeIn(minHeight = ChannelVideoFlowTokens.Sizes.touchTarget)
+                                .testTag(
+                                    TagFilterTestTags.expand(item.summary.normalizedName),
+                                ),
+                        ) {
+                            Text(
+                                stringResource(
+                                    if (expanded) R.string.tags_collapse else R.string.tags_expand,
+                                ),
+                            )
+                        }
+                    }
+                }
             }
-        }
-    }
 }
 
 private enum class TagBodyState {
@@ -352,5 +437,8 @@ private enum class TagBodyState {
     MissingChannels,
     NoResults,
     Empty,
+    Error,
     Content,
 }
+
+private val RESPONSIVE_CONTENT_MAX_WIDTH = 720.dp

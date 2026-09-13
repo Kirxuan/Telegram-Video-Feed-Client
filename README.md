@@ -75,7 +75,7 @@ Telegram 里关注的频道越来越多，真正想看的视频却常常被聊�
 
 ### 在画质、流量与等待之间自己做决定
 
-提供自动、省流、720p 和原画偏好；通过 TDLib 分段读取可流式播放的视频，并在网络与设备状态允许时有界预加载下一条。移动数据下默认关闭预加载，不会悄悄把一长串视频提前下载。
+提供自动、省流、720p 和原画偏好；通过 TDLib 分段读取可流式播放的视频。1.2 使用固定双播放器，当前条播放时有界准备唯一下一条。移动数据预加载需在设置中开启，开启后同样支持备用准备；当前缓冲不足、断网或设备压力较高时优先保障当前视频。
 
 ### 私人账号工具，就应该保持克制
 
@@ -115,10 +115,10 @@ VELORA 可能很适合你，如果你：
 
 如果系统提示“未知来源应用”，请只为你用来下载 APK 的可信浏览器或文件管理器授予本次安装权限。建议从本仓库 Release 页面获取安装包，不要使用来源不明的二次打包版本。
 
-当前 v1.1.0 安装包为 `VELORA-1.1.0-arm64-v8a.apk`，SHA-256：
+当前 v1.2 安装包为 `VELORA-1.2-arm64-v8a.apk`，SHA-256：
 
 ```text
-ACFD472C3EAC18E63C1B746B2ABD0602D3C7D3CC3BFA611A3CE75A27B6723061
+6de1a4557ae397841caf8f80fbbfe15b724de1291fa1860eddce7795609dc6d1
 ```
 
 如果设备上曾安装 Android Debug 证书签名的开发版，需要先卸载旧版再安装正式版；卸载会同时清除旧版的本地登录、索引和缓存。后续版本请始终以对应 Release 页面公布的文件名和校验值为准。
@@ -156,7 +156,13 @@ VELORA 的隐私边界尽量做到简单、明确、可检查：
 
 ## 当前版本与验证状态
 
-当前版本为 **VELORA 1.1.0**，功能开发记录到 **Stage 24**。
+当前正式版本为 **VELORA 1.2**，包含移动数据加载优化、播完自动切换、简介折叠、进度条调整及播放期间保持亮屏。正式签名沿用 1.1.0，正式版用户可覆盖升级。详见 [1.2 发布说明](docs/RELEASE_1.2.md)。
+
+1.2 已纳入 Stage 25/26/27/28 的默认优化路径及后续体验修复；历史阶段报告仍按当时的候选状态与实测范围阅读。当前默认采用有界双播放器 C1（最多两个 ExoPlayer、备用无离屏 Surface）；开启移动数据预加载后准备唯一下一条，AUTO 备用优先准备真实 480p 并原样晋升。预加载预算按**秒**表达：目标是备够 **5 秒**，字节数由目标码率推导，硬上限 **20MiB**，大码率视频自然多分配、低清视频自然少分配。备用以实际缓冲 5 秒停止加载；当前缓冲达到 3 秒且未下降即可开始准备（TDLib 的 `NEXT_PRELOAD` 优先级低于当前播放，协议层不会抢占）。首次起播门槛按吞吐余量分档：低清且余量≥2×、首字节 P90≤350ms 用 **800ms**，余量≥1.6× 用 1200ms，高清晰度仅在余量≥2.5× 时用 1800ms，未知或弱网保留 2500ms，重缓冲恢复门槛不降。Stage 28 追加：同一文件只要拥有播放 owner，其残余预加载 owner 不再驱动下载窗口（消除双 owner 拉锯）；"未渲染首帧"时预加载降级为 256 KiB 有界储备而非停止；未渲染首帧时起播门槛按 500 ms/s 衰减、下限 1000 ms，把慢视频的最坏黑屏截断到个位数秒。当前首帧、seek、重缓冲和设备压力始终优先。C2 离屏解码作为独立比较候选，SampleQueue、Owner Promotion、R8/资源压缩和 TDLib 数据库加密实验保持各自显式开关。GitHub 方案比较见 [Stage 28 调研](docs/STAGE28_GITHUB_LOADING_RESEARCH.md)，红米 Note 11 Pro+ 移动数据实测、主机/模拟器检查与限制见 [Stage 28 记录](docs/STAGE28_MOBILE_FAST_START.md)；历史证据见 [Stage 27](docs/STAGE27_MOBILE_FAST_START.md)、[Stage 25](docs/STAGE25_OPTIMIZATION_RESULTS.md) 与 [Stage 26](docs/STAGE26_MOBILE_DUAL_PLAYER.md)。
+
+1.2 发布前主机测试 1815 项全部通过，lint 与 Release 构建通过；正式签名、权限、备份与凭证隔离检查通过。本次发布未重新执行模拟器 UI、真机安装或移动数据回归，这些项目尚未验证。
+
+首个画面和实际可播放时间分开记录，备用晋升遵守正式起播缓冲门槛；少数准备命中的快速切换不能代表任意视频都能秒开，也不能用配置值代替实测耗时。
 
 Stage 24 完成了公开发行所需的用户自行配置路径：所有非 debug 构建强制排除本机 `local.properties` 凭证，设备端参数使用 Android Keystore AES-GCM 加密；密文损坏会失败关闭并要求重新输入，凭证改变时会安全关闭并重建唯一 TDLib Client。
 
@@ -194,7 +200,7 @@ TDLib / Room / Media3 适配器
 
 - UI 不直接使用 TDLib、Room DAO，也不创建 ExoPlayer；
 - TDLib 类型、回调和错误不会越过 `telegram` 模块边界；
-- 全局只保留一个主要 Media3 ExoPlayer 发声，播放器数量不随页面增长；
+- 固定 ACTIVE/STANDBY 双播放器，只有 ACTIVE 发声；备用准备跨正常滑动保留，播放器数量不随页面增长；
 - `DataSpec.position/length` 会转换为 TDLib `downloadFile(offset, limit)` 区间请求；
 - 当前播放与唯一下一条预加载使用所有权令牌保护，快速滑动会取消已经过期的请求；
 - Room 只保存频道、视频、标签、游标与播放历史等元数据，不保存视频字节或授权凭证。
@@ -291,6 +297,14 @@ adb devices
 - [TDLib provenance](telegram/tdlib/TDLIB_PROVENANCE.md)
 - [Stage 23 视频索引优化](docs/STAGE23_VIDEO_INDEX_SCAN_OPTIMIZATION.md)
 - [Stage 24 用户自行配置凭证](docs/STAGE24_USER_CONFIGURED_CREDENTIALS.md)
+- [Stage 25 优化候选与验证结果](docs/STAGE25_OPTIMIZATION_RESULTS.md)（未发布；工作树默认 C1，C2/SampleQueue 为独立候选）
+- [Stage 26 移动数据双播放器优化](docs/STAGE26_MOBILE_DUAL_PLAYER.md)（历史工作与实测边界）
+- [Stage 28 GitHub 视频加载方案对比](docs/STAGE28_GITHUB_LOADING_RESEARCH.md)（本轮必选调研）
+- [Stage 28 移动数据秒开优化（第三轮）](docs/STAGE28_MOBILE_FAST_START.md)（当前工作与实测边界）
+- [Stage 29 播完自动滑入下一条](docs/STAGE29_CONTINUOUS_PLAYBACK.md)（连续播放实现、GitHub 方案对比与验证；已纳入 1.2）
+- [Stage 27 GitHub 视频加载方案对比](docs/STAGE27_GITHUB_LOADING_RESEARCH.md)
+- [Stage 27 移动数据秒开优化](docs/STAGE27_MOBILE_FAST_START.md)（历史工作与实测边界）
+- [GitHub 视频加载方案对比](docs/STAGE26_GITHUB_LOADING_RESEARCH.md)
 - [完整阶段文档目录](docs/)
 
 ## 参与贡献

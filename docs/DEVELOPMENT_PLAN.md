@@ -1,5 +1,11 @@
 # VELORA（曜流）分阶段开发计划
 
+> 当前已授权阶段（2026-09-10）：Stage 27 移动数据秒开优化。固定两实例复用、预算改为秒级（目标 5 秒、硬上限 20MiB）、480p 低清备用、分档快速起播、移动授权贯通、滑动交接保留、GitHub 方案比较、红米 Note 11 Pro+ 移动数据验证及总体指导同步；不再以单播放器验证为前置。完整阶段合同见 [Stage 27](STAGE27_MOBILE_FAST_START.md)，方案比较见 [Stage 27 调研](STAGE27_GITHUB_LOADING_RESEARCH.md)。
+
+> 2026-09-09：用户已授权在当前未提交候选上继续实施、操作 Redmi 移动数据验收、禁止提交、推送和发布。当前实现与本轮 Proof 见 [Stage 25 实施结果](STAGE25_OPTIMIZATION_RESULTS.md)。以下 Stage 24 状态与既有阶段编号为正式版历史记录。
+
+Stage 25 收尾已重新验证横屏全屏入口：常规 Compose 101/101，三种尺寸各 40/40；最新完整主机 test/lint/build 通过。Robolectric Android 16 的历史环境阻塞在原配置正常重跑时已解除。生产默认已切换为 C1 双播放器；Redmi 移动数据路径正在验收，Wi-Fi、iQOO 12、双 Codec 性能和功耗仍尚未验证。
+
 文档版本：2.4
 日期：2026-09-02
 状态：Stage 24 用户自行配置凭证、主机 Proof 与正式签名静态 Proof 已完成；仓库所有者报告当前版本 ARM64 真机安装和正常使用通过，并确认已取得 Telegram 对本次无 sponsored messages/广告发行的书面例外许可

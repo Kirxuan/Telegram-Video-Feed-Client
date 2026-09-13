@@ -53,10 +53,53 @@ function ConvertTo-NullableLong {
     return $null
 }
 
+function ConvertFrom-CvfMemInfo {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*TOTAL PSS:\s*(?<pss>\d+)\b') {
+            return [pscustomobject]@{ PssKb = [long]$Matches['pss']; Available = $true }
+        }
+    }
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*TOTAL\s+(?<pss>\d+)\s+') {
+            return [pscustomobject]@{ PssKb = [long]$Matches['pss']; Available = $true }
+        }
+    }
+    return [pscustomobject]@{ PssKb = $null; Available = $false }
+}
+
+function ConvertFrom-CvfGfxInfo {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+
+    $total = $null
+    $janky = $null
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*Total frames rendered:\s*(?<value>\d+)\b') {
+            $total = [long]$Matches['value']
+        }
+        if ($line -match '^\s*Janky frames:\s*(?<value>\d+)\b') {
+            $janky = [long]$Matches['value']
+        }
+    }
+    return [pscustomobject]@{
+        TotalFrames = $total
+        JankyFrames = $janky
+        JankyRatePercent = if ($null -ne $total -and $total -gt 0 -and $null -ne $janky) {
+            [Math]::Round(100.0 * $janky / $total, 2)
+        } else {
+            $null
+        }
+        Available = $null -ne $total -and $null -ne $janky
+    }
+}
+
 function ConvertFrom-CvfBenchmarkLog {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
         [Parameter(Mandatory = $true)][string]$PackageName
     )
 
@@ -147,6 +190,19 @@ function ConvertFrom-CvfBenchmarkLog {
     $startupCandidateCounts = @{}
     $ownerHandoffMillis = [System.Collections.Generic.List[long]]::new()
     $rebufferCount = 0
+    $explicitRebufferCount = 0
+    $previousRebufferCount = 0
+    $playableSamples = [Collections.Generic.List[object]]::new()
+    $skippedNextWastedBytes = [System.Collections.Generic.List[long]]::new()
+    $feedInitialEmissionMillis = [System.Collections.Generic.List[long]]::new()
+    $feedHydrationMillis = [System.Collections.Generic.List[long]]::new()
+    $visibleFirstFrameMillis = [System.Collections.Generic.List[long]]::new()
+    $feedSnapshotKeyCounts = [System.Collections.Generic.List[long]]::new()
+    $feedHydratedItemCounts = [System.Collections.Generic.List[long]]::new()
+    $cacheTouchWrites = 0L
+    $tdFileEventsReceived = 0L
+    $tdFileEventsApplied = 0L
+    $tdFileEventsCoalesced = 0L
     $processCrashCount = 0
     $cmdlineCrashCount = 0
 
@@ -235,6 +291,45 @@ function ConvertFrom-CvfBenchmarkLog {
         }
         if ($line -match 'CVF-Preload.*\baction=YIELD\b') {
             $preloadYieldCount += 1
+            continue
+        }
+        if ($line -match 'CVF-Preload.*\bskippedNextWastedBytes=') {
+            $fields = Get-CvfLogFields -Line $line
+            $wasted = if ($fields.ContainsKey('skippedNextWastedBytes')) {
+                ConvertTo-NullableLong $fields['skippedNextWastedBytes']
+            } else {
+                $null
+            }
+            if ($null -ne $wasted) { $skippedNextWastedBytes.Add($wasted) }
+        }
+        if ($line -match 'CVF-FeedPerf.*\bsummary\b') {
+            $fields = Get-CvfLogFields -Line $line
+            foreach ($metric in @(
+                @{ Name = 'firstEmissionMs'; Values = $feedInitialEmissionMillis },
+                @{ Name = 'hydrateMs'; Values = $feedHydrationMillis },
+                @{ Name = 'visibleFirstFrameMs'; Values = $visibleFirstFrameMillis },
+                @{ Name = 'snapshotKeys'; Values = $feedSnapshotKeyCounts },
+                @{ Name = 'hydratedItems'; Values = $feedHydratedItemCounts }
+            )) {
+                if (-not $fields.ContainsKey($metric.Name)) { continue }
+                $value = ConvertTo-NullableLong $fields[$metric.Name]
+                if ($null -ne $value) { $metric.Values.Add($value) }
+            }
+            continue
+        }
+        if ($line -match 'CVF-CachePerf.*\bsummary\b') {
+            $fields = Get-CvfLogFields -Line $line
+            foreach ($counter in @(
+                @{ Name = 'touchWrites'; Target = 'cacheTouchWrites' },
+                @{ Name = 'eventReceived'; Target = 'tdFileEventsReceived' },
+                @{ Name = 'eventApplied'; Target = 'tdFileEventsApplied' },
+                @{ Name = 'eventCoalesced'; Target = 'tdFileEventsCoalesced' }
+            )) {
+                if (-not $fields.ContainsKey($counter.Name)) { continue }
+                $value = ConvertTo-NullableLong $fields[$counter.Name]
+                if ($null -eq $value) { continue }
+                Set-Variable -Name $counter.Target -Value $value
+            }
             continue
         }
         if ($line -match 'CVF-Preload.*\baction=RESUME\b') {
@@ -358,8 +453,22 @@ function ConvertFrom-CvfBenchmarkLog {
             $noProgressTimeoutCount += 1
             continue
         }
-        if ($line -match 'CVF-Player.*\bstate=BUFFERING\b.*\brebufferCount=(?<count>\d+)') {
-            if ([int]$Matches['count'] -gt 0) { $rebufferCount += 1 }
+        if ($line -match 'CVF-Player.*\brebuffer started count=') {
+            $explicitRebufferCount += 1
+            continue
+        }
+        if ($line -match 'CVF-Player.*\bplayable\b') {
+            $fields = Get-CvfLogFields -Line $line
+            if ($fields.ContainsKey('chatId') -and $fields.ContainsKey('messageId') -and $fields.ContainsKey('bindToReadyMs')) {
+                $playableSamples.Add([pscustomobject]@{ Key = "$($fields['chatId']):$($fields['messageId'])"; Millis = [long]$fields['bindToReadyMs'] })
+            }
+            continue
+        }
+        if ($line -match 'CVF-Player.*\brebufferCount=(?<count>\d+)') {
+            $currentCount = [int]$Matches['count']
+            # Old builds repeat cumulative counts in state/sample/summary lines.
+            if ($currentCount -gt $previousRebufferCount) { $rebufferCount += $currentCount - $previousRebufferCount }
+            $previousRebufferCount = $currentCount
             continue
         }
         if ($line -match ('Process:\s*' + [regex]::Escape($PackageName) + '\s*,')) {
@@ -385,6 +494,7 @@ function ConvertFrom-CvfBenchmarkLog {
             Count = $values.Count
             P50 = Get-NearestRankPercentile -Values $values -Percentile 50
             P90 = Get-NearestRankPercentile -Values $values -Percentile 90
+            P95 = Get-NearestRankPercentile -Values $values -Percentile 95
             Max = if ($values.Count -gt 0) { [long](($values | Measure-Object -Maximum).Maximum) } else { $null }
         }
     }
@@ -423,13 +533,17 @@ function ConvertFrom-CvfBenchmarkLog {
         if ($fields.ContainsKey('refreshOutcome') -and $fields['refreshOutcome'] -notin @('SUCCESS', 'FALLBACK', 'SKIPPED')) {
             $invalid = $true
         }
-        foreach ($numericField in @('refreshMs', 'bindToFirstByteMs', 'bindToReadyMs', 'bindToTerminalMs')) {
+        foreach ($numericField in @('refreshMs', 'bindToFirstByteMs', 'bindToTerminalMs')) {
             if (
                 -not $fields.ContainsKey($numericField) -or
                 $null -eq (ConvertTo-NullableLong $fields[$numericField])
             ) {
                 $invalid = $true
             }
+        }
+        if ($fields.ContainsKey('bindToReadyMs') -and $fields['bindToReadyMs'] -ne 'null' -and
+            $null -eq (ConvertTo-NullableLong $fields['bindToReadyMs'])) {
+            $invalid = $true
         }
         if (
             $fields.ContainsKey('promoted') -and
@@ -454,6 +568,11 @@ function ConvertFrom-CvfBenchmarkLog {
         TransparentRecoveryEligibleCount = $transparentRecoveryEligibleCount
         Metrics = [pscustomobject]$metrics
         SuccessfulSampleCount = $successfulFields.Count
+        PoolReadyHitSampleCount = @($successfulFields | Where-Object { $_['poolPromoted'] -eq 'true' -and $_['poolPreparedReady'] -eq 'true' }).Count
+        PoolReadyHitBindMetric = New-CvfByteMetric -Values @(
+            $successfulFields | Where-Object { $_['poolPromoted'] -eq 'true' -and $_['poolPreparedReady'] -eq 'true' } |
+                ForEach-Object { ConvertTo-NullableLong $_['bindToTerminalMs'] } | Where-Object { $null -ne $_ }
+        )
         RandomOrderConfirmed = $successfulFields.Count -gt 0 -and
             $orderCounts.RANDOM -eq $successfulFields.Count
         RequiredFieldsComplete = $successfulFields.Count -gt 0 -and
@@ -496,6 +615,21 @@ function ConvertFrom-CvfBenchmarkLog {
         SpeculativeCoveredMetric = New-CvfByteMetric -Values $speculativeCoveredBytes.ToArray()
         SpeculativeExtraMetric = New-CvfByteMetric -Values $speculativeRequestedExtraBytes.ToArray()
         SpeculativeCompletedExtraMetric = New-CvfByteMetric -Values $speculativeCompletedExtraBytes.ToArray()
+        SkippedNextWastedMetric = New-CvfByteMetric -Values $skippedNextWastedBytes.ToArray()
+        PreloadHitRatePercent = if ($currentReusedNextOwnerEligibleCount -gt 0) {
+            [Math]::Round(100.0 * $currentReusedNextOwnerCount / $currentReusedNextOwnerEligibleCount, 1)
+        } else {
+            $null
+        }
+        FeedInitialEmissionMetric = New-CvfByteMetric -Values $feedInitialEmissionMillis.ToArray()
+        FeedHydrationMetric = New-CvfByteMetric -Values $feedHydrationMillis.ToArray()
+        VisibleFirstFrameMetric = New-CvfByteMetric -Values $visibleFirstFrameMillis.ToArray()
+        FeedSnapshotKeyMetric = New-CvfByteMetric -Values $feedSnapshotKeyCounts.ToArray()
+        FeedHydratedItemMetric = New-CvfByteMetric -Values $feedHydratedItemCounts.ToArray()
+        CacheTouchWrites = $cacheTouchWrites
+        TdFileEventsReceived = $tdFileEventsReceived
+        TdFileEventsApplied = $tdFileEventsApplied
+        TdFileEventsCoalesced = $tdFileEventsCoalesced
         CurrentReusedNextOwnerCount = $currentReusedNextOwnerCount
         CurrentReusedNextOwnerEligibleCount = $currentReusedNextOwnerEligibleCount
         ExtractorRangeSwitchCount = $extractorRangeSwitchCount
@@ -513,7 +647,11 @@ function ConvertFrom-CvfBenchmarkLog {
                 $null
             }
         }
-        RebufferCount = $rebufferCount
+        RebufferCount = if ($explicitRebufferCount -gt 0) { $explicitRebufferCount } else { $rebufferCount }
+        PlayableReadyMetric = New-CvfByteMetric -Values @($playableSamples | Where-Object {
+            $candidate = $_
+            @($successfulFields | Where-Object { "$($_['chatId']):$($_['messageId'])" -eq $candidate.Key }).Count -gt 0
+        } | ForEach-Object { [long]$_.Millis })
         CrashCount = [Math]::Max($processCrashCount, $cmdlineCrashCount)
     }
 }
@@ -525,6 +663,7 @@ function New-CvfByteMetric {
         Count = $Values.Count
         P50 = Get-NearestRankPercentile -Values $Values -Percentile 50
         P90 = Get-NearestRankPercentile -Values $Values -Percentile 90
+        P95 = Get-NearestRankPercentile -Values $Values -Percentile 95
         Max = if ($Values.Count -gt 0) {
             [long](($Values | Measure-Object -Maximum).Maximum)
         } else {
@@ -550,6 +689,22 @@ function Test-CvfRequestedDirection {
     return $Summary.SuccessfulSampleCount -gt 0 -and
         $null -ne $directionProperty -and
         $directionProperty.Value -eq $Summary.SuccessfulSampleCount
+}
+
+function Test-CvfPlaybackUiTree {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$UiTree)
+    $start = $UiTree.IndexOf('<?xml', [StringComparison]::Ordinal)
+    $end = $UiTree.IndexOf('</hierarchy>', [StringComparison]::Ordinal)
+    if ($start -lt 0 -or $end -lt $start) { return $false }
+    try {
+        $document = [xml]$UiTree.Substring($start, $end + 12 - $start)
+        # The loading state has no play button; auto-hide has only the reveal surface.
+        # Both still belong to the player route. Order is checked from transition evidence.
+        return $null -ne $document.SelectSingleNode(
+            '//node[@package="com.qixuan.channelvideoflow" and (@content-desc="返回频道" or @content-desc="显示播放控制")]'
+        )
+    } catch { return $false }
 }
 
 function Test-CvfRandomSelectedUiTree {
@@ -580,11 +735,12 @@ function Test-CvfRandomSelectedUiTree {
 
 function Protect-CvfBenchmarkLog {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
 
     $safeLines = [System.Collections.Generic.List[string]]::new()
     foreach ($line in $Lines) {
         $allowed =
+            $line -match 'CVF-Player.*\b(playable|rebuffer started)\b' -or
             $line -match 'CVF-Transition.*\bsummary\b' -or
             $line -match 'CVF-Preload.*\baction=(YIELD|RESUME|START)\b' -or
             $line -match 'CVF-Preload.*\baction=CANDIDATE_READY\b' -or
@@ -592,6 +748,9 @@ function Protect-CvfBenchmarkLog {
             $line -match 'CVF-Adaptive.*\bstate=' -or
             $line -match 'CVF-Player.*\b(state state=BUFFERING|summary |error category=)' -or
             $line -match 'CVF-StartupRange.*\bsummary\b' -or
+            $line -match 'CVF-FeedPerf.*\bsummary\b' -or
+            $line -match 'CVF-CachePerf.*\bsummary\b' -or
+            $line -match 'CVF-Preload.*\bskippedNextWastedBytes=' -or
             $line -match 'CVF-TdFile.*\bresult=(PREEMPTED_BY_CURRENT|REUSED_ACTIVE|SWITCH|MERGE)\b' -or
             $line -match 'CVF-TdFile.*\bcancel fileId=' -or
             $line -match 'CVF-TdFile.*\brange timeout\b.*\breason=NO_PROGRESS\b'
@@ -608,8 +767,11 @@ function Protect-CvfBenchmarkLog {
 Export-ModuleMember -Function @(
     'Get-NearestRankPercentile',
     'Get-CvfFastSwipeBatches',
+    'ConvertFrom-CvfMemInfo',
+    'ConvertFrom-CvfGfxInfo',
     'ConvertFrom-CvfBenchmarkLog',
     'Test-CvfRequestedDirection',
     'Test-CvfRandomSelectedUiTree',
+    'Test-CvfPlaybackUiTree',
     'Protect-CvfBenchmarkLog'
 )

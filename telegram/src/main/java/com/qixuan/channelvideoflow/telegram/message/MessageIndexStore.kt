@@ -5,12 +5,14 @@ import com.qixuan.channelvideoflow.database.ChannelScanRecord
 import com.qixuan.channelvideoflow.database.PersistedVideo
 import com.qixuan.channelvideoflow.database.TagSummaryRecord
 import com.qixuan.channelvideoflow.database.VideoEntity
+import com.qixuan.channelvideoflow.database.VideoFeedKeyRow
 import com.qixuan.channelvideoflow.database.VideoIndexDao
 import com.qixuan.channelvideoflow.database.VideoPageWrite
 import com.qixuan.channelvideoflow.database.VideoTagRecord
 import com.qixuan.channelvideoflow.model.channel.ChannelScanState
 import com.qixuan.channelvideoflow.model.video.TagFilterMode
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 
 internal interface MessageIndexStore {
     fun observeSelectedChannelScans(): Flow<List<ChannelScanRecord>>
@@ -29,11 +31,13 @@ internal interface MessageIndexStore {
 
     suspend fun replaceVideoAndTags(persisted: PersistedVideo)
 
-    suspend fun markUnsupportedEdit(chatId: Long, messageId: Long)
+    suspend fun markUnsupportedEdit(chatId: Long, messageId: Long, invalidatedAt: Long)
 
     suspend fun updateEditTime(chatId: Long, messageId: Long, editTime: Long?)
 
-    suspend fun deleteMessages(chatId: Long, messageIds: List<Long>)
+    suspend fun deleteMessages(chatId: Long, messageIds: List<Long>, invalidatedAt: Long)
+
+    suspend fun purgeInvalidatedBefore(cutoffExclusive: Long): Int
 
     suspend fun updateScanFailure(
         chatId: Long,
@@ -57,6 +61,31 @@ internal interface MessageIndexStore {
         normalizedTags: Set<String>,
         tagMode: TagFilterMode,
     ): Flow<List<VideoEntity>>
+
+    fun observeFilteredVideoKeys(
+        channelIds: Set<Long>,
+        normalizedTags: Set<String>,
+        tagMode: TagFilterMode,
+    ): Flow<List<VideoFeedKeyRow>> = observeFilteredVideos(channelIds, normalizedTags, tagMode)
+        .map { entities ->
+            entities.map { entity ->
+                VideoFeedKeyRow(
+                    chatId = entity.chatId,
+                    messageId = entity.messageId,
+                    publishTime = entity.publishTime,
+                    editTime = entity.editTime,
+                )
+            }
+        }
+
+    suspend fun getVideosForKeyWindow(keys: List<Pair<Long, Long>>): List<VideoEntity> =
+        keys.mapNotNull { (chatId, messageId) -> getVideo(chatId, messageId) }
+
+    suspend fun getVideoTagsForKeyWindow(keys: List<Pair<Long, Long>>): List<VideoTagRecord> {
+        val exactKeys = keys.toSet()
+        return getVideoTagsForChannels(keys.map { it.first }.distinct())
+            .filter { record -> record.chatId to record.messageId in exactKeys }
+    }
 
     suspend fun getVideoTagsForChannels(channelIds: List<Long>): List<VideoTagRecord>
 
@@ -91,14 +120,20 @@ internal class RoomMessageIndexStore(
     override suspend fun replaceVideoAndTags(persisted: PersistedVideo) =
         dao.replaceVideoAndTags(persisted)
 
-    override suspend fun markUnsupportedEdit(chatId: Long, messageId: Long) =
-        dao.markUnsupportedEdit(chatId, messageId)
+    override suspend fun markUnsupportedEdit(chatId: Long, messageId: Long, invalidatedAt: Long) =
+        dao.markUnsupportedEdit(chatId, messageId, invalidatedAt)
 
     override suspend fun updateEditTime(chatId: Long, messageId: Long, editTime: Long?) =
         dao.updateEditTime(chatId, messageId, editTime)
 
-    override suspend fun deleteMessages(chatId: Long, messageIds: List<Long>) =
-        dao.deleteMessages(chatId, messageIds)
+    override suspend fun deleteMessages(
+        chatId: Long,
+        messageIds: List<Long>,
+        invalidatedAt: Long,
+    ) = dao.deleteMessages(chatId, messageIds, invalidatedAt)
+
+    override suspend fun purgeInvalidatedBefore(cutoffExclusive: Long): Int =
+        dao.purgeInvalidatedBefore(cutoffExclusive)
 
     override suspend fun updateScanFailure(
         chatId: Long,
@@ -130,6 +165,26 @@ internal class RoomMessageIndexStore(
         normalizedTags: Set<String>,
         tagMode: TagFilterMode,
     ): Flow<List<VideoEntity>> = dao.observeFilteredVideos(channelIds, normalizedTags, tagMode)
+
+    override fun observeFilteredVideoKeys(
+        channelIds: Set<Long>,
+        normalizedTags: Set<String>,
+        tagMode: TagFilterMode,
+    ): Flow<List<VideoFeedKeyRow>> = dao.observeFilteredVideoKeys(channelIds, normalizedTags, tagMode)
+
+    override suspend fun getVideosForKeyWindow(keys: List<Pair<Long, Long>>): List<VideoEntity> =
+        keys.distinct().groupBy { it.first }.flatMap { (chatId, rows) ->
+            rows.chunked(400).flatMap { chunk ->
+                dao.getVideosForKeyWindow(listOf(chatId), chunk.map { it.second })
+            }
+        }
+
+    override suspend fun getVideoTagsForKeyWindow(keys: List<Pair<Long, Long>>): List<VideoTagRecord> =
+        keys.distinct().groupBy { it.first }.flatMap { (chatId, rows) ->
+            rows.chunked(400).flatMap { chunk ->
+                dao.getVideoTagsForKeyWindow(listOf(chatId), chunk.map { it.second })
+            }
+        }
 
     override suspend fun getVideoTagsForChannels(channelIds: List<Long>): List<VideoTagRecord> =
         dao.getVideoTagsForChannels(channelIds)

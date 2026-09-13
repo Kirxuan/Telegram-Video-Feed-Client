@@ -15,7 +15,10 @@ import com.qixuan.channelvideoflow.domain.media.PreloadOwnerHandoffPhase
 import com.qixuan.channelvideoflow.domain.media.StreamingNetworkMetricsEstimator
 import com.qixuan.channelvideoflow.domain.media.StreamingNetworkMetricsRepository
 import com.qixuan.channelvideoflow.domain.media.VideoPreloadController
-import com.qixuan.channelvideoflow.domain.video.VideoPlaybackQueue
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservation
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservationFailure
+import com.qixuan.channelvideoflow.domain.message.VideoFeedKeySnapshot
+import com.qixuan.channelvideoflow.domain.video.PlaybackFeedSession
 import com.qixuan.channelvideoflow.domain.video.VideoFeedOnboardingPreferences
 import com.qixuan.channelvideoflow.domain.video.VideoQueueRandomSource
 import com.qixuan.channelvideoflow.model.channel.TelegramChannel
@@ -38,6 +41,7 @@ import com.qixuan.channelvideoflow.player.VideoPlaybackState
 import com.qixuan.channelvideoflow.player.VideoPlaybackSpeeds
 import com.qixuan.channelvideoflow.player.VideoPlayerSnapshot
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -45,13 +49,17 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -522,6 +530,75 @@ class VideoPlaybackViewModelTest {
     }
 
     @Test
+    fun productionFeedObservesAllKeysButHydratesOnlyBoundedWindows() = runTest(dispatcher) {
+        val repository = FakeMessageRepository(
+            (1L..100L).map { messageId -> video(messageId, messageId) },
+        )
+        val controller = FakeVideoPlaybackController()
+        val viewModel = viewModel(controller, repository, initialOrder = VideoFeedOrder.LATEST)
+
+        runCurrent()
+
+        assertEquals(100, viewModel.uiState.value.feedKeys.size)
+        assertTrue(viewModel.uiState.value.items.size <= 7)
+        assertTrue(repository.hydrationRequests.single().size <= 7)
+
+        viewModel.onPageSettled(pagerPage = 50, logicalPage = 50)
+        runCurrent()
+
+        assertEquals(VideoKey(1, 50), controller.binds.last().key)
+        assertTrue(repository.hydrationRequests.last().size <= 7)
+        assertTrue(viewModel.uiState.value.items.size <= 8)
+    }
+
+    @Test
+    fun lateHydrationFromReplacedFilterCannotRestoreOldFeed() = runTest(dispatcher) {
+        val oldHydration = CompletableDeferred<Unit>()
+        val repository = FakeMessageRepository(
+            initialVideos = listOf(video(1, 1)),
+            hydrationGates = ArrayDeque(listOf(oldHydration)),
+            ignoreHydrationCancellation = true,
+        )
+        val viewModel = viewModel(
+            FakeVideoPlaybackController(),
+            repository,
+            initialOrder = VideoFeedOrder.LATEST,
+        )
+        runCurrent()
+
+        viewModel.setFilter(VideoFilter(channelIds = emptySet()))
+        runCurrent()
+        oldHydration.complete(Unit)
+        runCurrent()
+
+        assertEquals(VideoFeedPhase.EMPTY, viewModel.uiState.value.phase)
+        assertTrue(viewModel.uiState.value.feedKeys.isEmpty())
+        assertTrue(viewModel.uiState.value.items.isEmpty())
+    }
+
+    @Test
+    fun retryActuallyResubscribesAfterKeyObservationFailure() = runTest(dispatcher) {
+        val repository = FakeMessageRepository(
+            initialVideos = listOf(video(1, 1)),
+            keyObservationFailuresBeforeSuccess = 1,
+        )
+        val viewModel = viewModel(
+            FakeVideoPlaybackController(),
+            repository,
+            initialOrder = VideoFeedOrder.LATEST,
+        )
+        runCurrent()
+        assertEquals(VideoFeedPhase.ERROR, viewModel.uiState.value.phase)
+
+        viewModel.retryFeedObservation()
+        runCurrent()
+
+        assertEquals(2, repository.keyObservationSubscriptions)
+        assertEquals(VideoFeedPhase.CONTENT, viewModel.uiState.value.phase)
+        assertEquals(listOf(VideoKey(1, 1)), viewModel.uiState.value.feedKeys)
+    }
+
+    @Test
     fun newPlaybackSessionReturnsToRandomAfterPreviousSessionSelectedLatest() =
         runTest(dispatcher) {
             val firstSession = viewModel(
@@ -587,7 +664,7 @@ class VideoPlaybackViewModelTest {
         runTest(dispatcher) {
             val controller = FakeVideoPlaybackController()
             val preloader = FakeVideoPreloadController()
-            val queue = VideoPlaybackQueue(FixedVideoQueueRandom(0, 0, 1, 0, 0, 0, 0, 0))
+            val queue = PlaybackFeedSession(FixedVideoQueueRandom(0, 0, 1, 0, 0, 0, 0, 0))
             val repository = FakeMessageRepository(
                 (1L..3L).map { messageId -> video(messageId, messageId) },
             )
@@ -596,7 +673,7 @@ class VideoPlaybackViewModelTest {
                 repository = repository,
                 preloader = preloader,
                 initialOrder = null,
-                playbackQueue = queue,
+                feedSession = queue,
             )
             runCurrent()
             val currentItems = viewModel.uiState.value.items
@@ -606,11 +683,11 @@ class VideoPlaybackViewModelTest {
                 controller.emitFirstFrame()
                 runCurrent()
             }
-            val upcomingFirst = requireNotNull(queue.randomRoundState?.upcoming).items.first()
+            val upcomingFirst = requireNotNull(queue.current().upcoming).keys.first()
 
-            assertEquals(upcomingFirst.key, preloader.targets.mapNotNull { it }.last().key)
+            assertEquals(upcomingFirst, preloader.targets.mapNotNull { it }.last().key)
             val refreshCountBeforePromotion =
-                repository.refreshedKeys.count { it == upcomingFirst.key }
+                repository.refreshedKeys.count { it == upcomingFirst }
 
             viewModel.onPageUnstable()
             viewModel.onPageTargeted(pagerPage = currentItems.size, logicalPage = 0)
@@ -618,14 +695,14 @@ class VideoPlaybackViewModelTest {
             viewModel.onPageSettled(pagerPage = currentItems.size, logicalPage = 0)
             runCurrent()
 
-            assertEquals(upcomingFirst.key, controller.binds.last().key)
+            assertEquals(upcomingFirst, controller.binds.last().key)
             assertEquals(
-                upcomingFirst.key,
-                queue.randomRoundState?.current?.items?.first()?.key,
+                upcomingFirst,
+                queue.current().keys.firstOrNull(),
             )
             assertEquals(
                 refreshCountBeforePromotion,
-                repository.refreshedKeys.count { it == upcomingFirst.key },
+                repository.refreshedKeys.count { it == upcomingFirst },
             )
             assertEquals(
                 true,
@@ -641,12 +718,12 @@ class VideoPlaybackViewModelTest {
         runTest(dispatcher) {
             val controller = FakeVideoPlaybackController()
             val preloader = FakeVideoPreloadController()
-            val queue = VideoPlaybackQueue(FixedVideoQueueRandom(0, 0, 0, 1, 0, 0))
+            val queue = PlaybackFeedSession(FixedVideoQueueRandom(0, 0, 0, 1, 0, 0))
             val viewModel = viewModel(
                 controller = controller,
                 preloader = preloader,
                 initialOrder = null,
-                playbackQueue = queue,
+                feedSession = queue,
             )
             runCurrent()
             val current = viewModel.uiState.value.items
@@ -686,12 +763,12 @@ class VideoPlaybackViewModelTest {
                 video(messageId = messageId, publishTime = messageId, fileId = messageId.toInt())
             }
             val repository = FakeMessageRepository(original)
-            val queue = VideoPlaybackQueue(FixedVideoQueueRandom(0, 0, 1, 0))
+            val queue = PlaybackFeedSession(FixedVideoQueueRandom(0, 0, 1, 0))
             val viewModel = viewModel(
                 controller = FakeVideoPlaybackController(),
                 repository = repository,
                 initialOrder = null,
-                playbackQueue = queue,
+                feedSession = queue,
             )
             runCurrent()
             val currentKeys = viewModel.uiState.value.items.map { it.video.key }
@@ -721,13 +798,13 @@ class VideoPlaybackViewModelTest {
             val repository = FakeMessageRepository(original)
             val preloader = FakeVideoPreloadController()
             val controller = FakeVideoPlaybackController()
-            val queue = VideoPlaybackQueue(FixedVideoQueueRandom(0, 0, 1, 0, 0, 0))
+            val queue = PlaybackFeedSession(FixedVideoQueueRandom(0, 0, 1, 0, 0, 0))
             val viewModel = viewModel(
                 controller = controller,
                 repository = repository,
                 preloader = preloader,
                 initialOrder = null,
-                playbackQueue = queue,
+                feedSession = queue,
             )
             runCurrent()
             val currentLastIndex = viewModel.uiState.value.items.lastIndex
@@ -735,7 +812,7 @@ class VideoPlaybackViewModelTest {
             runCurrent()
             controller.emitFirstFrame()
             runCurrent()
-            val removedKey = requireNotNull(queue.randomRoundState?.upcoming).items.first().key
+            val removedKey = requireNotNull(queue.current().upcoming).keys.first()
             assertEquals(removedKey, preloader.targets.mapNotNull { it }.last().key)
             val stopsBeforeDeletion = preloader.stopCalls
 
@@ -749,7 +826,7 @@ class VideoPlaybackViewModelTest {
     @Test
     fun staleUpcomingRoundRefreshCannotBindAfterFilterInvalidatesBothRounds() =
         runTest(dispatcher) {
-            val queue = VideoPlaybackQueue(FixedVideoQueueRandom(0, 0, 1, 0))
+            val queue = PlaybackFeedSession(FixedVideoQueueRandom(0, 0, 1, 0))
             val upcomingGate = CompletableDeferred<Unit>()
             val repository = FakeMessageRepository(
                 initialVideos = (1L..3L).map { messageId -> video(messageId, messageId) },
@@ -760,7 +837,7 @@ class VideoPlaybackViewModelTest {
                 controller = controller,
                 repository = repository,
                 initialOrder = null,
-                playbackQueue = queue,
+                feedSession = queue,
             )
             runCurrent()
             val lastIndex = viewModel.uiState.value.items.lastIndex
@@ -794,7 +871,9 @@ class VideoPlaybackViewModelTest {
         runCurrent()
 
         assertEquals(listOf(VideoKey(1, 2)), controller.binds.map { it.key })
-        assertEquals(listOf(VideoKey(1, 1)), preloader.targets.mapNotNull { it?.key })
+        // The bounded byte stage can already have registered the target of the superseded page;
+        // what this case is about is the final next target of the actually bound video.
+        assertEquals(VideoKey(1, 1), preloader.targets.mapNotNull { it?.key }.last())
         assertTrue(controller.transitionPauses >= 1)
     }
 
@@ -869,7 +948,7 @@ class VideoPlaybackViewModelTest {
     }
 
     @Test
-    fun nextNetworkPreloadWaitsUntilCurrentItemHasRenderedAFrame() = runTest(dispatcher) {
+    fun boundedNextBytePrefixIsRegisteredWhileTheCurrentItemStillHasNoFirstFrame() = runTest(dispatcher) {
         val controller = FakeVideoPlaybackController()
         val preloader = FakeVideoPreloadController()
         val viewModel = viewModel(controller, preloader = preloader)
@@ -878,7 +957,33 @@ class VideoPlaybackViewModelTest {
         viewModel.onPageSettled(pagerPage = 0, logicalPage = 0)
         runCurrent()
 
-        assertTrue(preloader.targets.mapNotNull { it }.isEmpty())
+        // The decoder-free byte stage only needs the single next target, so its bounded 256 KiB
+        // TTFB prefix must not wait for the current item's first frame. No standby engine is
+        // created here, so the current startup reserve keeps the link.
+        assertEquals(listOf(VideoKey(1, 2)), preloader.targets.mapNotNull { it?.key })
+        assertTrue(controller.standbyPreparations.isEmpty())
+    }
+
+    @Test
+    fun heavyPoolStandbyStillWaitsForTheFirstFrameBeforeTakingTheNextTarget() = runTest(dispatcher) {
+        val controller = FakeVideoPlaybackController(standbySupported = true)
+        val preloader = FakeVideoPreloadController()
+        val viewModel = viewModel(controller, preloader = preloader)
+        runCurrent()
+
+        viewModel.onPageSettled(pagerPage = 0, logicalPage = 0)
+        runCurrent()
+
+        assertEquals(listOf(VideoKey(1, 2)), preloader.targets.mapNotNull { it?.key })
+        assertTrue(
+            "the heavy standby must not start before the current item renders a frame",
+            controller.standbyPreparations.isEmpty(),
+        )
+
+        controller.emitFirstFrame()
+        runCurrent()
+
+        assertEquals(listOf(VideoKey(1, 2)), controller.standbyPreparations.map { it.key })
     }
 
     @Test
@@ -2291,7 +2396,7 @@ class VideoPlaybackViewModelTest {
             assertEquals(402, controller.binds.single().playbackFileId)
             controller.emitFirstFrame()
             runCurrent()
-            assertEquals(401, preloader.targets.mapNotNull { it }.last().playbackFileId)
+            assertEquals(301, preloader.targets.mapNotNull { it }.last().playbackFileId)
 
             repeat(3) { metrics.recordAtBitsPerSecond(500_000L) }
             runCurrent()
@@ -2346,6 +2451,146 @@ class VideoPlaybackViewModelTest {
         assertEquals(402, controller.binds.single().playbackFileId)
     }
 
+    @Test
+    fun autoThroughputSamplesDoNotRebuildTheSamePreparedRepresentation() = runTest(dispatcher) {
+        val first = video(messageId = 1, publishTime = 1, fileId = 101)
+            .withAdaptiveAlternatives(301, 401)
+        val second = video(messageId = 2, publishTime = 2, fileId = 102)
+            .withAdaptiveAlternatives(302, 402)
+        val metrics = StreamingNetworkMetricsEstimator()
+        val controller = FakeVideoPlaybackController()
+        val preloader = FakeVideoPreloadController()
+        val repository = FakeMessageRepository(listOf(first, second),
+            refreshedVideos = mapOf(first.key to first, second.key to second))
+        val viewModel = viewModel(controller, repository, preloader = preloader,
+            cacheController = FakeMediaCacheController(MediaCacheState(videoQualityPreference = VideoQualityPreference.AUTO)),
+            policySource = FakeDevicePolicySource(NetworkTransport.MOBILE), networkMetrics = metrics)
+        runCurrent()
+        viewModel.onPageSettled(0, 0)
+        runCurrent()
+        controller.emitFirstFrame()
+        runCurrent()
+        repeat(3) { metrics.recordAtBitsPerSecond(500_000L) }
+        runCurrent()
+        val refreshCount = repository.refreshedKeys.size
+        val preparedFile = preloader.targets.mapNotNull { it }.last().playbackFileId
+        repeat(12) { index ->
+            metrics.recordAtBitsPerSecond(250_000L - index * 2_000L)
+            runCurrent()
+        }
+        assertEquals("Same representation must not trigger refresh/cancel storms", refreshCount, repository.refreshedKeys.size)
+        assertEquals(preparedFile, preloader.targets.mapNotNull { it }.last().playbackFileId)
+        viewModel.onPageUnstable()
+        viewModel.onPageTargeted(1, 1)
+        runCurrent()
+        viewModel.onPageSettled(1, 1)
+        runCurrent()
+        assertEquals(preparedFile, controller.binds.last().playbackFileId)
+    }
+
+    @Test
+    fun largeMobileOriginalDoesNotBindBeforeConsent() = runTest(dispatcher) {
+        val large = video(1, 1).copy(fileSize = 300L * 1024 * 1024)
+        val controller = FakeVideoPlaybackController()
+        val preloader = FakeVideoPreloadController()
+        val vm = viewModel(controller, FakeMessageRepository(listOf(large)), preloader,
+            policySource = FakeDevicePolicySource(NetworkTransport.MOBILE))
+        runCurrent()
+        vm.onPageSettled(0, 0)
+        runCurrent()
+        assertTrue(controller.binds.isEmpty())
+        assertTrue(preloader.currentStarting.isEmpty())
+    }
+
+    @Test
+    fun largeMobileNextOriginalDoesNotPreloadBeforeConsent() = runTest(dispatcher) {
+        val large = video(1, 1).copy(fileSize = 300L * 1024 * 1024)
+        val controller = FakeVideoPlaybackController()
+        val preloader = FakeVideoPreloadController()
+        val vm = viewModel(controller, FakeMessageRepository(listOf(video(2, 2), large)), preloader,
+            policySource = FakeDevicePolicySource(NetworkTransport.MOBILE))
+        runCurrent()
+        vm.onPageSettled(0, 0)
+        runCurrent()
+        controller.emitReadyFirstFrame()
+        runCurrent()
+        assertTrue(preloader.targets.none { it?.key == large.key })
+    }
+
+    @Test
+    fun originalConsentIsSingleUseAndCannotApproveADifferentPage() = runTest(dispatcher) {
+        val first = video(2, 2).copy(fileSize = 300L * 1024 * 1024)
+        val second = video(1, 1).copy(fileSize = 400L * 1024 * 1024)
+        val controller = FakeVideoPlaybackController()
+        val vm = viewModel(controller, FakeMessageRepository(listOf(first, second)),
+            policySource = FakeDevicePolicySource(NetworkTransport.MOBILE))
+        runCurrent()
+        vm.onPageSettled(0, 0)
+        runCurrent()
+        assertEquals(first, vm.uiState.value.originalPlaybackAwaitingConfirmation)
+        vm.confirmOriginalPlayback(first.key, first.fileId)
+        vm.confirmOriginalPlayback(first.key, first.fileId)
+        runCurrent()
+        assertEquals(listOf(first), controller.binds)
+        vm.onPageUnstable()
+        vm.onPageSettled(1, 1)
+        runCurrent()
+        vm.confirmOriginalPlayback(first.key, first.fileId)
+        runCurrent()
+        assertEquals(listOf(first), controller.binds)
+        assertEquals(second, vm.uiState.value.originalPlaybackAwaitingConfirmation)
+        vm.onPageUnstable()
+        vm.onPageSettled(0, 0)
+        runCurrent()
+        assertEquals(first, vm.uiState.value.originalPlaybackAwaitingConfirmation)
+        assertEquals(1, controller.binds.size)
+    }
+
+    @Test
+    fun mobileSwitchStopsAnUnapprovedLargeWifiOriginal() = runTest(dispatcher) {
+        val large = video(1, 1).copy(fileSize = 300L * 1024 * 1024)
+        val controller = FakeVideoPlaybackController()
+        val policy = FakeDevicePolicySource(NetworkTransport.WIFI)
+        val vm = viewModel(controller, FakeMessageRepository(listOf(large)), policySource = policy)
+        runCurrent()
+        vm.onPageSettled(0, 0)
+        runCurrent()
+        assertEquals(1, controller.binds.size)
+        policy.setNetwork(NetworkTransport.MOBILE)
+        runCurrent()
+        assertEquals(large, vm.uiState.value.originalPlaybackAwaitingConfirmation)
+        assertEquals(VideoPlaybackState.Idle, controller.snapshot.value.playbackState)
+        vm.onForegroundChanged(false)
+        vm.confirmOriginalPlayback(large.key, large.fileId)
+        runCurrent()
+        assertEquals(1, controller.binds.size)
+        vm.onForegroundChanged(true)
+        vm.confirmOriginalPlayback(large.key, large.fileId)
+        runCurrent()
+        assertEquals(2, controller.binds.size)
+    }
+
+    @Test
+    fun changedQualityReevaluatesPendingOriginalInsteadOfApprovingStalePlan() = runTest(dispatcher) {
+        val large = video(1, 1).copy(fileSize = 300L * 1024 * 1024)
+        val controller = FakeVideoPlaybackController()
+        val cache = FakeMediaCacheController()
+        val vm = viewModel(controller, FakeMessageRepository(listOf(large)), cacheController = cache,
+            policySource = FakeDevicePolicySource(NetworkTransport.MOBILE))
+        runCurrent()
+        vm.onPageSettled(0, 0)
+        runCurrent()
+        cache.setVideoQualityPreference(VideoQualityPreference.DATA_SAVER)
+        runCurrent()
+        vm.confirmOriginalPlayback(large.key, large.fileId)
+        runCurrent()
+        assertTrue(controller.binds.isEmpty())
+        assertEquals(large, vm.uiState.value.originalPlaybackAwaitingConfirmation)
+        vm.confirmOriginalPlayback(large.key, large.fileId)
+        runCurrent()
+        assertEquals(listOf(large), controller.binds)
+    }
+
     private fun viewModel(
         controller: FakeVideoPlaybackController,
         repository: FakeMessageRepository = FakeMessageRepository(
@@ -2359,7 +2604,7 @@ class VideoPlaybackViewModelTest {
         cacheController: FakeMediaCacheController = FakeMediaCacheController(),
         policySource: FakeDevicePolicySource = FakeDevicePolicySource(NetworkTransport.WIFI),
         initialOrder: VideoFeedOrder? = VideoFeedOrder.LATEST,
-        playbackQueue: VideoPlaybackQueue = VideoPlaybackQueue(),
+        feedSession: PlaybackFeedSession = PlaybackFeedSession(),
         onboardingPreferences: FakeVideoFeedOnboardingPreferences =
             FakeVideoFeedOnboardingPreferences(),
         networkMetrics: StreamingNetworkMetricsRepository =
@@ -2372,7 +2617,7 @@ class VideoPlaybackViewModelTest {
             preloadController = preloader,
             cacheController = cacheController,
             devicePolicySource = policySource,
-            playbackQueue = playbackQueue,
+            feedSession = feedSession,
             onboardingPreferences = onboardingPreferences,
             networkMetrics = networkMetrics,
             testMarker = Unit,
@@ -2468,11 +2713,16 @@ class VideoPlaybackViewModelTest {
         private val refreshGates: Map<VideoKey, CompletableDeferred<Unit>> = emptyMap(),
         private val refreshFailures: Map<VideoKey, Throwable> = emptyMap(),
         private val emitRefreshResultsToVideos: Boolean = false,
+        private val hydrationGates: ArrayDeque<CompletableDeferred<Unit>> = ArrayDeque(),
+        private val ignoreHydrationCancellation: Boolean = false,
+        private val keyObservationFailuresBeforeSuccess: Int = 0,
     ) : TelegramMessageRepository {
         private val videos = MutableStateFlow(initialVideos)
         private val refreshedByKey = refreshedVideos.toMutableMap()
         var lastRefreshed: IndexedVideo? = null
         val refreshedKeys = mutableListOf<VideoKey>()
+        val hydrationRequests = mutableListOf<List<VideoKey>>()
+        var keyObservationSubscriptions = 0
         val queuedRefreshResults = ArrayDeque<VideoReferenceResolution>()
         val queuedRefreshGates = ArrayDeque<CompletableDeferred<Unit>>()
         override val scanProgress: Flow<List<ChannelVideoScanProgress>> = flowOf(emptyList())
@@ -2481,6 +2731,39 @@ class VideoPlaybackViewModelTest {
             .let { flow ->
                 if (filter.channelIds.isEmpty()) flowOf(emptyList()) else flow
             }
+
+        override fun observeVideoKeyObservation(
+            filter: VideoFilter,
+        ): Flow<RepositoryObservation<List<VideoFeedKeySnapshot>>> = flow {
+            keyObservationSubscriptions += 1
+            if (keyObservationSubscriptions <= keyObservationFailuresBeforeSuccess) {
+                emit(RepositoryObservation(emptyList(), RepositoryObservationFailure.DATABASE))
+                return@flow
+            }
+            emitAll(
+                observeVideos(filter).map { source ->
+                    RepositoryObservation(
+                        source.map { video ->
+                            VideoFeedKeySnapshot(video.key, video.publishTime, video.editTime)
+                        },
+                    )
+                },
+            )
+        }
+
+        override suspend fun hydrateVideos(keys: List<VideoKey>): RepositoryObservation<List<IndexedVideo>> {
+            hydrationRequests += keys
+            val byKey = videos.value.associateBy(IndexedVideo::key)
+            val hydrated = keys.mapNotNull(byKey::get)
+            hydrationGates.removeFirstOrNull()?.let { gate ->
+                if (ignoreHydrationCancellation) {
+                    withContext(NonCancellable) { gate.await() }
+                } else {
+                    gate.await()
+                }
+            }
+            return RepositoryObservation(hydrated)
+        }
 
         override fun observeTags(channelIds: Set<Long>): Flow<List<TagSummary>> = flowOf(emptyList())
         override suspend fun refreshVideo(videoKey: VideoKey): VideoReferenceResolution {
@@ -2521,9 +2804,13 @@ class VideoPlaybackViewModelTest {
         override suspend fun resumeScanning() = Unit
     }
 
-    private class FakeVideoPlaybackController : VideoPlaybackController {
+    private class FakeVideoPlaybackController(
+        private val standbySupported: Boolean = false,
+    ) : VideoPlaybackController {
         private val mutableSnapshot = MutableStateFlow(VideoPlayerSnapshot())
         override val snapshot: StateFlow<VideoPlayerSnapshot> = mutableSnapshot.asStateFlow()
+        override val supportsStandbyPreparation: Boolean get() = standbySupported
+        val standbyPreparations = mutableListOf<IndexedVideo>()
         val binds = mutableListOf<IndexedVideo>()
         val playableBinds = mutableListOf<IndexedVideo>()
         var transitionPauses = 0
@@ -2536,6 +2823,15 @@ class VideoPlaybackViewModelTest {
         val transitionEvents = mutableListOf<PlaybackTransitionEvent>()
         val temporarySpeedChanges = mutableListOf<Boolean>()
         val events = mutableListOf<String>()
+
+        override fun prepareStandby(
+            video: IndexedVideo,
+            context: com.qixuan.channelvideoflow.player.PlaybackPreparationContext,
+        ): Boolean {
+            if (!standbySupported) return false
+            standbyPreparations += video
+            return true
+        }
 
         override fun recordTransition(event: PlaybackTransitionEvent) {
             transitionEvents += event

@@ -1,13 +1,15 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Serial,
-    [ValidateRange(1, 100)][int]$SwipeCount = 12,
+    [ValidateRange(1, 1000)][int]$SwipeCount = 12,
     [ValidateRange(1, 120)][int]$PerSwipeTimeoutSeconds = 12,
+    [ValidateRange(0, 15000)][int]$WatchMillis = 0,
     [ValidateSet('Normal', 'Fast')][string]$Mode = 'Normal',
     [ValidateSet('Forward', 'Reverse')][string]$Direction = 'Forward',
     [ValidateRange(5, 120)][int]$PlaybackReadyTimeoutSeconds = 30,
     [ValidateRange(0, 100)][int]$FastCheckpointEvery = 0,
-    [ValidateSet('stage13b', 'stage13c', 'stage13d', 'stage13e', 'stage13f', 'stage18')][string]$ReportStage = 'stage13d',
+    [ValidateSet('stage13b', 'stage13c', 'stage13d', 'stage13e', 'stage13f', 'stage18', 'stage25a', 'stage25f', 'stage25g', 'stage26', 'stage27')][string]$ReportStage = 'stage13d',
+    [ValidateSet('Debug', 'Benchmark')][string]$BuildVariant = 'Debug',
     [switch]$SkipBuild
 )
 
@@ -25,12 +27,23 @@ $reportTitle = switch ($ReportStage) {
     'stage13e' { 'Stage 13E random reference resolution benchmark' }
     'stage13f' { 'Stage 13F random final acceptance benchmark' }
     'stage18' { 'Stage 18 HLS and weak-network continuous playback benchmark' }
+    'stage25a' { 'Stage 25A release-like performance baseline' }
+    'stage25f' { 'Stage 25F SampleQueue candidate A/B' }
+    'stage25g' { 'Stage 25G fixed two-player pool candidate A/B' }
+    'stage26' { 'Stage 26 mobile-data dual-player acceptance' }
+    'stage27' { 'Stage 27 mobile-data fast-start acceptance' }
 }
 $comparisonGuidance = if ($ReportStage -eq 'stage13f') {
     'Compare bind→first-frame against the Stage 13A RANDOM baseline only when media/cache/network conditions are comparable; compare release→settle against the fresh Stage 13E production baseline.'
 }
 elseif ($ReportStage -eq 'stage18') {
     'Compare identical Stage 18 flag builds only with the same account, queue, media, quality, network window, and cache precondition; SampleQueue requires at least 15% P95 improvement, 100% FIRST_FRAME, and zero safety failures.'
+}
+elseif ($ReportStage -in @('stage26', 'stage27')) {
+    'Report all cellular attempts, timeouts and READY subgroup separately. Different media, watch time, cache or network conditions are observational samples, not a controlled speedup claim. Keep account and index intact.'
+}
+elseif ($ReportStage -in @('stage25f', 'stage25g')) {
+    'Compare only against a fresh Stage 25A single-player production baseline under the same account, queue, media, network window, thermal state, and cache precondition. A candidate stays disabled without device A/B evidence and zero safety regressions.'
 }
 else {
     'Compare bind→first-frame against the fresh Stage 13C RANDOM baseline; startup-range and owner counters classify the long tail without media inspection.'
@@ -61,6 +74,8 @@ function Find-Adb {
 }
 
 $Adb = Find-Adb
+$mainLogHistory = [Collections.Generic.List[string]]::new()
+$mainLogSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
 function Invoke-Adb {
     param(
@@ -76,11 +91,17 @@ function Invoke-Adb {
 }
 
 function Get-MainLogLines {
-    return @(Invoke-Adb -AdbArguments @(
+    $snapshot = Invoke-Adb -AdbArguments @(
         '-s', $Serial, 'logcat', '-b', 'main', '-d', '-v', 'threadtime', '-s',
         'CVF-Transition:I', 'CVF-Player:I', 'CVF-Preload:I', 'CVF-Adaptive:I',
-        'CVF-StartupRange:I', 'CVF-TdFile:I'
-    ))
+        'CVF-StartupRange:I', 'CVF-TdFile:I', 'CVF-FeedPerf:I', 'CVF-CachePerf:I'
+    )
+    # logcat is a ring buffer. Retain every observed line throughout this run so
+    # device log rotation cannot erase earlier terminals or make counters decrease.
+    foreach ($line in $snapshot) {
+        if ($mainLogSeen.Add([string]$line)) { $mainLogHistory.Add([string]$line) }
+    }
+    return $mainLogHistory.ToArray()
 }
 
 function Get-CrashLogLines {
@@ -89,7 +110,29 @@ function Get-CrashLogLines {
     ) -AllowFailure)
 }
 
+function Get-ProcessMemInfo {
+    $lines = Invoke-Adb -AdbArguments @(
+        '-s', $Serial, 'shell', 'dumpsys', 'meminfo', $PackageName
+    ) -AllowFailure
+    return ConvertFrom-CvfMemInfo -Lines $lines
+}
+
+function Reset-FrameStats {
+    Invoke-Adb -AdbArguments @(
+        '-s', $Serial, 'shell', 'dumpsys', 'gfxinfo', $PackageName, 'reset'
+    ) -AllowFailure | Out-Null
+}
+
+function Get-FrameStats {
+    $lines = Invoke-Adb -AdbArguments @(
+        '-s', $Serial, 'shell', 'dumpsys', 'gfxinfo', $PackageName
+    ) -AllowFailure
+    return ConvertFrom-CvfGfxInfo -Lines $lines
+}
+
 function Clear-BenchmarkLogs {
+    $mainLogHistory.Clear()
+    $mainLogSeen.Clear()
     Invoke-Adb -AdbArguments @('-s', $Serial, 'logcat', '-b', 'main', '-c') | Out-Null
     Invoke-Adb -AdbArguments @('-s', $Serial, 'logcat', '-b', 'crash', '-c') | Out-Null
 }
@@ -117,17 +160,27 @@ function Test-PlaybackPageSafely {
             '-s', $Serial, 'exec-out', 'uiautomator', 'dump', '/dev/tty'
         ) -AllowFailure
     ) -join "`n"
-    return $tree.Contains('content-desc="返回频道"') -and
-        (Test-CvfRandomSelectedUiTree -UiTree $tree) -and
-        (
-            $tree.Contains('content-desc="暂停视频"') -or
-            $tree.Contains('content-desc="继续播放"')
-        )
+    # Playback controls auto-hide while the video remains on the same page. Recognize the
+    # app-owned reveal-control surface so natural playback is not misreported as navigation.
+    # The order selector can be collapsed or animating. RANDOM is independently required
+    # from every transition's diagnostic at report time, not guessed from transient UI.
+    return Test-CvfPlaybackUiTree -UiTree $tree
+}
+
+function Assert-PlaybackPageBeforeGesture {
+    Wake-BenchmarkDisplay
+    # UIAutomator can momentarily return no idle root during the controls animation.
+    # Retry observation only; never send a gesture without a verified playback surface.
+    for ($observation = 0; $observation -lt 3; $observation += 1) {
+        if (Test-PlaybackPageSafely) { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw 'Playback page changed before a gesture; sampling stopped without sending another swipe.'
 }
 
 function Wait-ForInitialPlayback {
     $deadline = [DateTime]::UtcNow.AddSeconds($PlaybackReadyTimeoutSeconds)
-    Write-Output "请在 $PlaybackReadyTimeoutSeconds 秒内安全进入播放页；脚本不会自动点击、退出账号或清理缓存。"
+    Write-Host "请在 $PlaybackReadyTimeoutSeconds 秒内安全进入播放页；脚本不会自动点击、退出账号或清理缓存。"
     while ([DateTime]::UtcNow -lt $deadline) {
         if (Test-PlaybackPageSafely) { return $true }
         Start-Sleep -Milliseconds 250
@@ -138,12 +191,14 @@ function Wait-ForInitialPlayback {
 function Wait-ForTerminalAfter {
     param(
         [Parameter(Mandatory = $true)][int]$PreviousCount,
+        [int]$PreviousReadyCount = -1,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
     )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
-        $summary = ConvertFrom-CvfBenchmarkLog -Lines (Get-MainLogLines) -PackageName $PackageName
-        if ((Get-TerminalCount -Summary $summary) -gt $PreviousCount) { return $true }
+        $summary = ConvertFrom-CvfBenchmarkLog -Lines @(Get-MainLogLines) -PackageName $PackageName
+        if ((Get-TerminalCount -Summary $summary) -gt $PreviousCount -and
+            ($PreviousReadyCount -lt 0 -or $summary.PlayableReadyMetric.Count -gt $PreviousReadyCount)) { return $true }
         Start-Sleep -Milliseconds 100
     }
     return $false
@@ -208,6 +263,8 @@ $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $baseName = "random-swipe-first-frame-$($Mode.ToLowerInvariant())-$($Direction.ToLowerInvariant())-$timestamp"
 $reportPath = Join-Path $reportRoot "$baseName.md"
 $evidencePath = Join-Path $reportRoot "$baseName.log"
+$summaryPath = Join-Path $reportRoot "$baseName.summary.json"
+$attempts = [Collections.Generic.List[object]]::new()
 
 try {
     $deviceLines = @(& $Adb devices)
@@ -223,12 +280,17 @@ try {
     if (-not $SkipBuild) {
         Push-Location $repoRoot
         try {
-            & .\gradlew.bat assembleDebug --no-daemon --console=plain
-            if ($LASTEXITCODE -ne 0) { throw 'assembleDebug failed' }
+            $assembleTask = if ($BuildVariant -eq 'Benchmark') { 'assembleBenchmark' } else { 'assembleDebug' }
+            & .\gradlew.bat $assembleTask --no-daemon --console=plain
+            if ($LASTEXITCODE -ne 0) { throw "$assembleTask failed" }
         } finally {
             Pop-Location
         }
-        $apkPath = Join-Path $repoRoot 'app/build/outputs/apk/debug/app-debug.apk'
+        $apkPath = if ($BuildVariant -eq 'Benchmark') {
+            Join-Path $repoRoot 'app/build/outputs/apk/benchmark/app-benchmark.apk'
+        } else {
+            Join-Path $repoRoot 'app/build/outputs/apk/debug/app-debug.apk'
+        }
         if (-not (Test-Path -LiteralPath $apkPath -PathType Leaf)) {
             throw 'debug APK was not produced'
         }
@@ -245,6 +307,8 @@ try {
     $uid = Get-AppUid
     $trafficBefore = Get-UidNetworkBytes -Uid $uid
     Clear-BenchmarkLogs
+    Reset-FrameStats
+    $memoryBefore = Get-ProcessMemInfo
     # A warm launcher intent resets the current in-app navigation route on this app. Preserve an
     # already verified playback page so the benchmark does not invalidate its own precondition.
     if (-not (Test-PlaybackPageSafely)) {
@@ -280,6 +344,7 @@ try {
     }
     $gestureDuration = if ($Mode -eq 'Fast') { 80 } else { 150 }
     $timedOut = $false
+    $attempts = [Collections.Generic.List[object]]::new()
     [int[]]$fastBatches = if ($Mode -eq 'Fast') {
         @(Get-CvfFastSwipeBatches -SwipeCount $SwipeCount -CheckpointEvery $FastCheckpointEvery)
     } else {
@@ -288,22 +353,28 @@ try {
 
     if ($Mode -eq 'Normal') {
         for ($index = 1; $index -le $SwipeCount; $index += 1) {
-            $beforeSummary = ConvertFrom-CvfBenchmarkLog -Lines (Get-MainLogLines) -PackageName $PackageName
+            if ($WatchMillis -gt 0) { Start-Sleep -Milliseconds $WatchMillis }
+            Assert-PlaybackPageBeforeGesture
+            $beforeSummary = ConvertFrom-CvfBenchmarkLog -Lines @(Get-MainLogLines) -PackageName $PackageName
             $beforeCount = Get-TerminalCount -Summary $beforeSummary
             Wake-BenchmarkDisplay
             Invoke-Adb -AdbArguments @(
                 '-s', $Serial, 'shell', 'input', 'swipe',
                 "$x", "$startY", "$x", "$endY", "$gestureDuration"
             ) | Out-Null
-            if (-not (Wait-ForTerminalAfter -PreviousCount $beforeCount -TimeoutSeconds $PerSwipeTimeoutSeconds)) {
+            $previousReady = if ($ReportStage -in @('stage26', 'stage27')) { $beforeSummary.PlayableReadyMetric.Count } else { -1 }
+            $completed = Wait-ForTerminalAfter -PreviousCount $beforeCount -PreviousReadyCount $previousReady -TimeoutSeconds $PerSwipeTimeoutSeconds
+            $attempts.Add([pscustomobject]@{ Attempt = $index; Gestures = 1; TerminalObserved = $completed; TimeoutSeconds = $PerSwipeTimeoutSeconds })
+            $attempts | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath "$evidencePath.attempts.json" -Encoding UTF8
+            if (-not $completed) {
                 $timedOut = $true
-                break
             }
             Start-Sleep -Milliseconds 250
         }
     } else {
         for ($batchIndex = 0; $batchIndex -lt $fastBatches.Count; $batchIndex += 1) {
-            $beforeSummary = ConvertFrom-CvfBenchmarkLog -Lines (Get-MainLogLines) -PackageName $PackageName
+            Assert-PlaybackPageBeforeGesture
+            $beforeSummary = ConvertFrom-CvfBenchmarkLog -Lines @(Get-MainLogLines) -PackageName $PackageName
             $beforeCount = Get-TerminalCount -Summary $beforeSummary
             for ($index = 1; $index -le $fastBatches[$batchIndex]; $index += 1) {
                 Wake-BenchmarkDisplay
@@ -313,9 +384,11 @@ try {
                 ) | Out-Null
                 Start-Sleep -Milliseconds 100
             }
-            if (-not (Wait-ForTerminalAfter -PreviousCount $beforeCount -TimeoutSeconds $PerSwipeTimeoutSeconds)) {
+            $completed = Wait-ForTerminalAfter -PreviousCount $beforeCount -TimeoutSeconds $PerSwipeTimeoutSeconds
+            $attempts.Add([pscustomobject]@{ Attempt = $batchIndex + 1; Gestures = $fastBatches[$batchIndex]; TerminalObserved = $completed; TimeoutSeconds = $PerSwipeTimeoutSeconds })
+            $attempts | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath "$evidencePath.attempts.json" -Encoding UTF8
+            if (-not $completed) {
                 $timedOut = $true
-                break
             }
             if ($batchIndex -lt $fastBatches.Count - 1) {
                 Start-Sleep -Milliseconds 250
@@ -324,10 +397,13 @@ try {
         if (-not $timedOut) { Start-Sleep -Milliseconds 750 }
     }
 
-    $mainLines = Get-MainLogLines
-    $crashLines = Get-CrashLogLines
+    $mainLines = @(Get-MainLogLines)
+    $attempts | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath "$evidencePath.attempts.json" -Encoding UTF8
+    $crashLines = @(Get-CrashLogLines)
     $allLines = @($mainLines) + @($crashLines)
     $summary = ConvertFrom-CvfBenchmarkLog -Lines $allLines -PackageName $PackageName
+    $memoryAfter = Get-ProcessMemInfo
+    $frameStats = Get-FrameStats
     $trafficAfter = Get-UidNetworkBytes -Uid $uid
     $safeEvidence = Protect-CvfBenchmarkLog -Lines $mainLines
     @($safeEvidence) + @("CVF-Benchmark crashCount=$($summary.CrashCount)") |
@@ -337,7 +413,8 @@ try {
     $bindMetric = $summary.Metrics.bindToTerminalMs
     $directionConfirmed = Test-CvfRequestedDirection -Summary $summary -Direction $Direction
     $enoughSamples = if ($Mode -eq 'Normal') {
-        $summary.SuccessfulSampleCount -eq $SwipeCount
+        $summary.SuccessfulSampleCount -eq $SwipeCount -and
+            ($ReportStage -notin @('stage26', 'stage27') -or $summary.PlayableReadyMetric.Count -eq $SwipeCount)
     } else {
         $summary.SuccessfulSampleCount -ge 1
     }
@@ -386,11 +463,16 @@ try {
     $report.Add('')
     $report.Add("- Result: $result")
     $report.Add("- Mode: $Mode")
+    $report.Add("- Build variant: $BuildVariant")
     $report.Add("- Requested direction: $Direction")
     $report.Add("- Requested swipes: $SwipeCount")
     $report.Add("- Fast batch sizes: $(if ($Mode -eq 'Fast') { $fastBatches -join ',' } else { 'n/a' })")
     $report.Add("- Successful first-frame samples: $($summary.SuccessfulSampleCount)")
+    $report.Add("- Attempt records including timeouts: $($attempts.Count); the evidence .attempts.json retains every attempted stable target/batch.")
+    $report.Add('- Latency percentiles below describe successful display callbacks only. Any failure/timeout invalidates an all-switch performance claim; never remove it from the report.')
     $report.Add("- Per-swipe timeout: ${PerSwipeTimeoutSeconds}s")
+    $report.Add("- Additional viewing time before each normal swipe: ${WatchMillis}ms")
+    if ($ReportStage -in @('stage26', 'stage27')) { $report.Add('- Normal protocol waits for visible first frame AND actual playable READY before its next viewing interval; all requested targets must reach READY for a pass.') }
     $report.Add('- Physical device and installed package: verified')
     $report.Add('- App data/cache/network/VPN: unchanged by this script')
     $report.Add('- Display: idempotent WAKEUP sent immediately before each verified gesture')
@@ -433,13 +515,14 @@ try {
     $report.Add('')
     $report.Add('## Segments (FIRST_FRAME only, nearest-rank)')
     $report.Add('')
-    $report.Add('| Segment | N | P50 | P90 | max |')
-    $report.Add('|---|---:|---:|---:|---:|')
+    $report.Add('| Segment | N | P50 | P90 | P95 | max |')
+    $report.Add('|---|---:|---:|---:|---:|---:|')
     foreach ($metricName in $metricLabels.Keys) {
         $metric = $summary.Metrics.$metricName
         $report.Add(
             "| $($metricLabels[$metricName]) | $($metric.Count) | " +
                 "$(Format-MetricValue $metric.P50) | $(Format-MetricValue $metric.P90) | " +
+                "$(Format-MetricValue $metric.P95) | " +
                 "$(Format-MetricValue $metric.Max) |"
         )
     }
@@ -497,6 +580,25 @@ try {
             "$(Format-MetricValue $handoff.Max)"
     )
     $report.Add("- rebuffer/crash: $($summary.RebufferCount)/$($summary.CrashCount)")
+    $report.Add("- Actual playable READY N/P50/P95/max: $($summary.PlayableReadyMetric.Count)/$($summary.PlayableReadyMetric.P50)/$($summary.PlayableReadyMetric.P95)/$($summary.PlayableReadyMetric.Max) ms. A visible still frame may precede READY; missing readiness is not zero wait.")
+    $report.Add("- preload hit rate: $($summary.PreloadHitRatePercent)%")
+    $waste = $summary.SkippedNextWastedMetric
+    $report.Add("- skipped-next wasted bytes N/P50/P90/max/total: $($waste.Count)/$($waste.P50)/$($waste.P90)/$($waste.Max)/$($waste.Total)")
+    $report.Add("- feed first emission (subscription latency, not SQL execution) P50/P90: $($summary.FeedInitialEmissionMetric.P50)/$($summary.FeedInitialEmissionMetric.P90) ms")
+    $report.Add("- feed hydration P50/P90: $($summary.FeedHydrationMetric.P50)/$($summary.FeedHydrationMetric.P90) ms")
+    $report.Add("- visible first frame P50/P90/P95: $($summary.VisibleFirstFrameMetric.P50)/$($summary.VisibleFirstFrameMetric.P90)/$($summary.VisibleFirstFrameMetric.P95) ms")
+    $report.Add("- cache metadata rows committed (not SQL statement count): $($summary.CacheTouchWrites)")
+    $report.Add("- TDLib file events received/applied/coalesced: $($summary.TdFileEventsReceived)/$($summary.TdFileEventsApplied)/$($summary.TdFileEventsCoalesced)")
+    if ($memoryBefore.Available -and $memoryAfter.Available) {
+        $report.Add("- PSS before/after/delta: $($memoryBefore.PssKb)/$($memoryAfter.PssKb)/$($memoryAfter.PssKb - $memoryBefore.PssKb) KiB")
+    } else {
+        $report.Add('- PSS: 尚未验证（设备未返回可解析的 dumpsys meminfo TOTAL）')
+    }
+    if ($frameStats.Available) {
+        $report.Add("- gfxinfo total/janky/rate: $($frameStats.TotalFrames)/$($frameStats.JankyFrames)/$($frameStats.JankyRatePercent)%")
+    } else {
+        $report.Add('- gfxinfo jank: 尚未验证（设备未返回可解析的帧统计）')
+    }
     if ($null -ne $trafficBefore -and $null -ne $trafficAfter) {
         $rxDelta = [Math]::Max(0L, $trafficAfter.RxBytes - $trafficBefore.RxBytes)
         $txDelta = [Math]::Max(0L, $trafficAfter.TxBytes - $trafficBefore.TxBytes)
@@ -507,12 +609,32 @@ try {
     $report.Add("- $comparisonGuidance")
     $report.Add('- Evidence is redacted; no Telegram content, names, paths, device/network identifiers, addresses, or credentials are stored.')
     $report | Set-Content -LiteralPath $reportPath -Encoding UTF8
+    [pscustomobject]@{
+        schemaVersion = 1
+        reportStage = $ReportStage
+        buildVariant = $BuildVariant
+        mode = $Mode
+        direction = $Direction
+        requestedSwipes = $SwipeCount
+        watchMillis = $WatchMillis
+        summary = $summary
+        memory = [pscustomobject]@{
+            beforePssKb = if ($memoryBefore.Available) { $memoryBefore.PssKb } else { $null }
+            afterPssKb = if ($memoryAfter.Available) { $memoryAfter.PssKb } else { $null }
+        }
+        frameStats = $frameStats
+    } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
 
     Write-Output "SWIPE_BENCHMARK_RESULT=$result"
     Write-Output "REPORT=$reportPath"
     Write-Output "EVIDENCE=$evidencePath"
+    Write-Output "SUMMARY=$summaryPath"
     if ($result -eq 'FAIL') { exit 5 }
 } catch {
+    Protect-CvfBenchmarkLog -Lines @(Get-MainLogLines) |
+        Set-Content -LiteralPath $evidencePath -Encoding UTF8
+    $attempts | ConvertTo-Json -Depth 3 |
+        Set-Content -LiteralPath "$evidencePath.attempts.json" -Encoding UTF8
     Write-FailureReport -Reason $_.Exception.Message -ReportPath $reportPath
     Write-Output 'SWIPE_BENCHMARK_RESULT=FAIL'
     Write-Output "REPORT=$reportPath"

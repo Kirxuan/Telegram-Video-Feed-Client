@@ -190,10 +190,66 @@ class DatabaseMigrationTest {
         }
     }
 
+    @Test
+    fun migration5To6PreservesRowsAndBackfillsOnlySoftDeletedInvalidationTime() {
+        helper.createDatabase(RETENTION_DATABASE_NAME, 5).apply {
+            execSQL(
+                """
+                INSERT INTO channels(
+                    chat_id, title, username, is_selected, last_new_message_id,
+                    oldest_scanned_message_id, initial_scan_completed, last_sync_time,
+                    access_state, scan_state, is_pinned, scan_paused_by_user,
+                    scan_retry_count, scanned_message_count, scanned_page_count,
+                    duplicate_video_encounter_count, scan_exception_count,
+                    scan_strategy_version, video_search_cursor, video_search_completed,
+                    video_candidate_count, video_search_page_count
+                ) VALUES(
+                    1, '保留期频道', NULL, 1, NULL, NULL, 1, 1000,
+                    'AVAILABLE', 'COMPLETED', 0, 0, 0, 0, 0, 0, 0,
+                    2, 0, 1, 0, 0
+                )
+                """.trimIndent(),
+            )
+            execSQL(
+                """
+                INSERT INTO videos(
+                    chat_id, message_id, file_id, remote_unique_id, caption,
+                    duration_seconds, width, height, file_size, supports_streaming,
+                    publish_time, edit_time, can_be_saved, is_deleted, indexed_at
+                ) VALUES
+                    (1, 10, 10, 'active', '', 10, 720, 1280, 1024, 1,
+                     10, NULL, 1, 0, 1000),
+                    (1, 11, 11, 'deleted', '', 10, 720, 1280, 1024, 1,
+                     11, NULL, 1, 1, 1100)
+                """.trimIndent(),
+            )
+            close()
+        }
+
+        helper.runMigrationsAndValidate(
+            RETENTION_DATABASE_NAME,
+            6,
+            true,
+            DatabaseMigrations.MIGRATION_5_6,
+        ).use { database ->
+            database.query(
+                "SELECT message_id, invalidated_at FROM videos ORDER BY message_id",
+            ).use { cursor ->
+                cursor.moveToFirst()
+                assertEquals(10L, cursor.getLong(0))
+                assertEquals(true, cursor.isNull(1))
+                cursor.moveToNext()
+                assertEquals(11L, cursor.getLong(0))
+                assertEquals(1100L, cursor.getLong(1))
+            }
+        }
+    }
+
     private companion object {
         const val DATABASE_NAME = "migration-stage-4"
         const val PIN_DATABASE_NAME = "migration-channel-pin"
         const val CACHE_DATABASE_NAME = "migration-media-cache"
         const val VIDEO_SEARCH_DATABASE_NAME = "migration-stage-23-video-search"
+        const val RETENTION_DATABASE_NAME = "migration-stage-25-retention"
     }
 }

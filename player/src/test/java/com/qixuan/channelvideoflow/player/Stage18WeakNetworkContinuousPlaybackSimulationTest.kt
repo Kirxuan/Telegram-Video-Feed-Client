@@ -129,7 +129,7 @@ class Stage18WeakNetworkContinuousPlaybackSimulationTest {
                     ),
                     peakBitrateBitsPerSecond = (selected.bitsPerSecond * 1.35).toLong(),
                     cachedCoveredBytes = cachedBytes(cacheMode, selected),
-                    downloadedNewNetworkBytes = 0L,
+                    requestedUncachedBytes = 0L,
                 ),
             )
             val nextBytes = if (isMobileWindow) 0L else budget.calculatedTargetBytes

@@ -23,6 +23,8 @@ data class VideoPlayerSnapshot(
     val hasRenderedFirstFrame: Boolean = false,
     val isPlaying: Boolean = false,
     val playbackSpeed: Float = VideoPlaybackSpeeds.NORMAL,
+    /** True only after the active binding reports Media3's actual end of media. */
+    val hasEnded: Boolean = false,
 )
 
 object VideoPlaybackSpeeds {
@@ -115,10 +117,23 @@ enum class TransparentRecoveryOutcome {
     REFRESHED_FILE_UNAVAILABLE,
 }
 
-/** ViewModel-facing contract for the one application-owned playback resource. */
+/** Exact in-memory context shared by plan preparation and the final stable bind. */
+data class PlaybackPreparationContext(
+    val qualityGeneration: Long,
+    val accountGeneration: Long,
+    val networkGeneration: Long,
+    val queueGeneration: Long,
+    val roundGeneration: Long?,
+)
+
+/** ViewModel-facing contract for application-owned playback resources. */
 @UnstableApi
 interface VideoPlaybackController {
     val snapshot: StateFlow<VideoPlayerSnapshot>
+
+    /** True only for the explicitly selected, physical-device playback-pool experiment. */
+    val supportsStandbyPreparation: Boolean
+        get() = false
 
     /**
      * Records a sanitized, in-memory transition boundary for Debug performance diagnostics.
@@ -132,6 +147,13 @@ interface VideoPlaybackController {
     fun detach(playerView: PlayerView)
 
     fun bind(video: IndexedVideo)
+
+    /** Prepares exactly one bounded next item when the pool experiment is enabled. */
+    fun bind(video: IndexedVideo, context: PlaybackPreparationContext) = bind(video)
+
+    fun prepareStandby(video: IndexedVideo, context: PlaybackPreparationContext): Boolean = false
+
+    fun discardStandby() = Unit
 
     /** Publishes an app-resolved terminal failure without creating a media binding. */
     fun showFailure(video: IndexedVideo, failure: VideoPlaybackFailure) = Unit

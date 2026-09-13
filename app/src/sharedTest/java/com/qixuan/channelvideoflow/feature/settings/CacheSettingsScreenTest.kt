@@ -21,6 +21,18 @@ class CacheSettingsScreenTest {
     val composeRule = createComposeRule()
 
     @Test
+    fun twentyGiBLimitIsVisibleOnEntryWithoutScrolling() {
+        composeRule.setContent {
+            CacheSettingsScreen(
+                uiState = CacheSettingsUiState(MediaCacheState(limitBytes = 20L * MediaCacheLimits.GIBIBYTE)),
+                onBack = {}, onLimitSelected = {}, onMobilePreloadChanged = {},
+                onVideoQualitySelected = {}, onRefresh = {}, onClear = {},
+            )
+        }
+        composeRule.onNodeWithText("当前缓存上限 20 GB").assertIsDisplayed()
+    }
+
+    @Test
     fun showsExactUsageDefaultLimitAndAllRequestedLimitChoices() {
         var selected: Long? = null
         composeRule.setContent {
@@ -44,6 +56,7 @@ class CacheSettingsScreenTest {
             .onNodeWithText("当前视频缓存：300 MB")
             .performScrollTo()
             .assertIsDisplayed()
+        composeRule.onNodeWithTag(CacheSettingsTestTags.LimitMenu).performScrollTo().performClick()
         composeRule.onNodeWithTag(
             CacheSettingsTestTags.limit(MediaCacheLimits.DEFAULT_BYTES),
         ).assertExists()
@@ -96,7 +109,7 @@ class CacheSettingsScreenTest {
         }
         composeRule
             .onNodeWithTag(CacheSettingsTestTags.quality(VideoQualityPreference.DATA_SAVER))
-            .performClick()
+            .performScrollTo().performClick()
         assertEquals(VideoQualityPreference.DATA_SAVER, selected)
     }
 }

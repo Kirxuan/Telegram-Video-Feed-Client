@@ -10,6 +10,34 @@ import org.junit.Test
 
 class VideoQualitySelectorTest {
     @Test
+    fun mobileAutoKeepsCheapestSourceEvenWithHighMeasuredBandwidth() {
+        val selected = VideoQualitySelector.select(
+            video(), VideoQualityPreference.AUTO, NetworkTransport.MOBILE, 100_000_000L,
+        )
+        assertEquals(103, selected.playbackFileId)
+    }
+
+    @Test
+    fun expensiveAlternativeCannotHideAnAffordableAlternative() {
+        val source = video().copy(alternativeVariants = listOf(
+            variant(201, 1920, 1080).copy(fileSize = 8_000_000L),
+            variant(202, 1280, 720).copy(fileSize = 2_000_000L),
+        ))
+        val selected = VideoQualitySelector.select(
+            source, VideoQualityPreference.AUTO, NetworkTransport.WIFI, 100_000_000L,
+        )
+        assertEquals(202, selected.playbackFileId)
+    }
+
+    @Test fun standbyPrefersReal480pAndHandlesPortraitAndMissingVariants() {
+        val source = video().copy(alternativeVariants = video().alternativeVariants + variant(104, 480, 852))
+        assertEquals(104, VideoQualitySelector.selectForStandby(source, VideoQualityPreference.AUTO, NetworkTransport.MOBILE).playbackFileId)
+        assertEquals(103, VideoQualitySelector.selectForStandby(video(), VideoQualityPreference.AUTO, NetworkTransport.MOBILE).playbackFileId)
+        assertEquals(100, VideoQualitySelector.selectForStandby(source.copy(alternativeVariants = emptyList()), VideoQualityPreference.AUTO, NetworkTransport.MOBILE).playbackFileId)
+        assertEquals(100, VideoQualitySelector.selectForStandby(source, VideoQualityPreference.ORIGINAL, NetworkTransport.MOBILE).playbackFileId)
+    }
+
+    @Test
     fun dataSaverChoosesLowestResolutionH264Alternative() {
         val selected = VideoQualitySelector.select(
             video = video(),
@@ -185,6 +213,22 @@ class VideoQualitySelectorTest {
         )
 
         assertEquals(302, selected.playbackFileId)
+    }
+
+    @Test
+    fun mobileOriginalAdmissionRespectsThresholdSourceAndExplicitPreference() {
+        val limit = OriginalPlaybackAdmission.CONFIRM_ABOVE_BYTES
+        val small = video().copy(fileSize = limit, alternativeVariants = emptyList())
+        val large = small.copy(fileSize = limit + 1)
+        for (preference in listOf(VideoQualityPreference.AUTO, VideoQualityPreference.DATA_SAVER)) {
+            assertEquals(false, OriginalPlaybackAdmission.requiresConfirmation(small, preference, NetworkTransport.MOBILE))
+            assertEquals(true, OriginalPlaybackAdmission.requiresConfirmation(large, preference, NetworkTransport.MOBILE))
+            assertEquals(false, OriginalPlaybackAdmission.requiresConfirmation(large, preference, NetworkTransport.WIFI))
+        }
+        assertEquals(false, OriginalPlaybackAdmission.requiresConfirmation(large, VideoQualityPreference.ORIGINAL, NetworkTransport.MOBILE))
+        val lower = VideoQualitySelector.select(video().copy(fileSize = limit + 1), VideoQualityPreference.AUTO, NetworkTransport.MOBILE)
+        assertEquals(false, OriginalPlaybackAdmission.requiresConfirmation(lower, VideoQualityPreference.AUTO, NetworkTransport.MOBILE))
+        assertEquals(false, OriginalPlaybackAdmission.requiresConfirmation(large.copy(supportsStreaming = false), VideoQualityPreference.AUTO, NetworkTransport.MOBILE))
     }
 
     private fun video() = IndexedVideo(

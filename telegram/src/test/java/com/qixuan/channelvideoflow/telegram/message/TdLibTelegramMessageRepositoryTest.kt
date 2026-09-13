@@ -14,6 +14,7 @@ import com.qixuan.channelvideoflow.model.video.OriginalMessageLinkResult
 import com.qixuan.channelvideoflow.model.video.VideoKey
 import com.qixuan.channelvideoflow.domain.message.VideoReferenceResolution
 import com.qixuan.channelvideoflow.domain.message.VideoReferenceFailure
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservationFailure
 import com.qixuan.channelvideoflow.telegram.client.TelegramClientFailure
 import com.qixuan.channelvideoflow.telegram.client.TelegramClientMessageLink
 import com.qixuan.channelvideoflow.telegram.client.TelegramClientMessageProperties
@@ -35,6 +36,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -44,6 +47,61 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TdLibTelegramMessageRepositoryTest {
+    @Test
+    fun databaseObservationFailureIsNotDisguisedAsEmptyContent() = runTest {
+        val store = FakeMessageIndexStore(channel()).apply {
+            failVideoObservation = true
+            failTagObservation = true
+            failScanObservation = true
+        }
+        val repository = repository(FakeMessageClient(FakeClock()), store, FakeClock())
+
+        val video = repository.observeVideoObservation(
+            com.qixuan.channelvideoflow.model.video.VideoFilter(setOf(1L)),
+        ).first()
+        val tags = repository.observeTagObservation(setOf(1L)).first()
+        val scan = repository.scanProgressObservation.first()
+
+        assertEquals(RepositoryObservationFailure.DATABASE, video.failure)
+        assertEquals(RepositoryObservationFailure.DATABASE, tags.failure)
+        assertEquals(RepositoryObservationFailure.DATABASE, scan.failure)
+        assertTrue(video.value.isEmpty())
+        assertTrue(tags.value.isEmpty())
+        assertTrue(scan.value.isEmpty())
+    }
+
+    @Test
+    fun firstForegroundEntryPurgesOnlyTheThirtyDayCutoffOncePerRepository() = runTest {
+        val retentionMillis = 30L * 24L * 60L * 60L * 1_000L
+        val clock = FakeClock(now = retentionMillis + 123L)
+        val store = FakeMessageIndexStore(channel(videoSearchCompleted = true))
+        val repository = repository(FakeMessageClient(clock), store, clock)
+
+        repository.setForeground(true)
+        repository.setForeground(false)
+        clock.now += 10_000L
+        repository.setForeground(true)
+
+        assertEquals(listOf(123L), store.purgeCutoffs)
+    }
+
+    @Test
+    fun failedRetentionCleanupDoesNotEnterForegroundAndRetriesNextTime() = runTest {
+        val clock = FakeClock(now = 30L * 24L * 60L * 60L * 1_000L + 9L)
+        val store = FakeMessageIndexStore(channel(videoSearchCompleted = true)).apply {
+            failNextPurge = true
+        }
+        val repository = repository(FakeMessageClient(clock), store, clock)
+
+        val failure = runCatching { repository.setForeground(true) }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertFalse(store.foregroundScanning)
+        repository.setForeground(true)
+        assertEquals(listOf(9L, 9L), store.purgeCutoffs)
+        assertTrue(store.foregroundScanning)
+    }
+
     @Test
     fun scansRecentPageFirstThenPaginatesFilteredVideosWithBoundaryDeduplication() = runTest {
         val clock = FakeClock()
@@ -958,11 +1016,21 @@ class TdLibTelegramMessageRepositoryTest {
         val pages = mutableListOf<VideoPageWrite>()
         val videos = mutableMapOf<Pair<Long, Long>, PersistedVideo>()
         val deleted = mutableSetOf<Pair<Long, Long>>()
+        val invalidatedAt = mutableMapOf<Pair<Long, Long>, Long>()
+        val purgeCutoffs = mutableListOf<Long>()
         var foregroundScanning = false
+        var failVideoObservation = false
+        var failTagObservation = false
+        var failScanObservation = false
+        var failNextPurge = false
 
         fun channel(chatId: Long = 1) = channels.getValue(chatId)
 
-        override fun observeSelectedChannelScans(): Flow<List<ChannelScanRecord>> = scanRecords
+        override fun observeSelectedChannelScans(): Flow<List<ChannelScanRecord>> = if (failScanObservation) {
+            flow { throw IllegalStateException("database unavailable") }
+        } else {
+            scanRecords
+        }
         override suspend fun getSelectedScanChannels() = channels.values.filter {
             it.isSelected && it.accessState == ChannelAccessState.AVAILABLE
         }
@@ -1011,17 +1079,42 @@ class TdLibTelegramMessageRepositoryTest {
         override suspend fun replaceVideoAndTags(persisted: PersistedVideo) {
             videos[persisted.video.chatId to persisted.video.messageId] = persisted
             deleted -= persisted.video.chatId to persisted.video.messageId
+            invalidatedAt -= persisted.video.chatId to persisted.video.messageId
         }
-        override suspend fun markUnsupportedEdit(chatId: Long, messageId: Long) {
-            deleted += chatId to messageId
+        override suspend fun markUnsupportedEdit(chatId: Long, messageId: Long, invalidatedAt: Long) {
+            val key = chatId to messageId
+            deleted += key
+            this.invalidatedAt[key] = invalidatedAt
         }
         override suspend fun updateEditTime(chatId: Long, messageId: Long, editTime: Long?) {
             val key = chatId to messageId
             val current = videos[key] ?: return
             videos[key] = current.copy(video = current.video.copy(editTime = editTime))
         }
-        override suspend fun deleteMessages(chatId: Long, messageIds: List<Long>) {
-            messageIds.forEach { deleted += chatId to it }
+        override suspend fun deleteMessages(
+            chatId: Long,
+            messageIds: List<Long>,
+            invalidatedAt: Long,
+        ) {
+            messageIds.forEach { messageId ->
+                val key = chatId to messageId
+                deleted += key
+                this.invalidatedAt[key] = invalidatedAt
+            }
+        }
+        override suspend fun purgeInvalidatedBefore(cutoffExclusive: Long): Int {
+            purgeCutoffs += cutoffExclusive
+            if (failNextPurge) {
+                failNextPurge = false
+                error("synthetic retention cleanup failure")
+            }
+            val expired = invalidatedAt.filterValues { it < cutoffExclusive }.keys
+            expired.forEach { key ->
+                invalidatedAt -= key
+                deleted -= key
+                videos -= key
+            }
+            return expired.size
         }
         override suspend fun updateScanFailure(
             chatId: Long,
@@ -1079,13 +1172,23 @@ class TdLibTelegramMessageRepositoryTest {
         override suspend fun clearAllIndex() {
             videos.clear()
             deleted.clear()
+            invalidatedAt.clear()
         }
         override fun observeFilteredVideos(
             channelIds: Set<Long>,
             normalizedTags: Set<String>,
             tagMode: TagFilterMode,
-        ): Flow<List<VideoEntity>> = flowOf(emptyList())
+        ): Flow<List<VideoEntity>> = if (failVideoObservation) {
+            flow { throw IllegalStateException("database unavailable") }
+        } else {
+            flowOf(emptyList())
+        }
         override suspend fun getVideoTagsForChannels(channelIds: List<Long>): List<VideoTagRecord> = emptyList()
-        override fun observeTagSummaries(channelIds: Set<Long>): Flow<List<TagSummaryRecord>> = flowOf(emptyList())
+        override fun observeTagSummaries(channelIds: Set<Long>): Flow<List<TagSummaryRecord>> =
+            if (failTagObservation) {
+                flow { throw IllegalStateException("database unavailable") }
+            } else {
+                flowOf(emptyList())
+            }
     }
 }

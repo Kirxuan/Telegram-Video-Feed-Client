@@ -31,6 +31,8 @@ internal enum class TemporaryPlaybackSpeedTermination {
 internal interface ReusablePlayerEngine<Media> {
     val playbackSpeed: Float
 
+    fun setActive(active: Boolean) = Unit
+
     fun setMedia(media: Media)
 
     fun prepare()
@@ -58,6 +60,9 @@ internal class ReusablePlayerLifecycle<Media>(
     private val startOrder: PlaybackStartOrder,
 ) {
     private var engine: ReusablePlayerEngine<Media>? = null
+    private var standbyEngine: ReusablePlayerEngine<Media>? = null
+    private var standbyToken: String? = null
+    private var standbyHasBinding = false
     private var hasBinding = false
     private var generatedBindingGeneration = 0L
     private var activeBindingGeneration: Long? = null
@@ -68,6 +73,9 @@ internal class ReusablePlayerLifecycle<Media>(
 
     val currentEngine: ReusablePlayerEngine<Media>?
         get() = engine
+
+    val preparedEngine: ReusablePlayerEngine<Media>?
+        get() = standbyEngine
 
     fun ensureEngine(): ReusablePlayerEngine<Media> = engine ?: factory().also { created ->
         engine = created
@@ -84,6 +92,7 @@ internal class ReusablePlayerLifecycle<Media>(
         activeBindingGeneration = bindingGeneration
         applyPlaybackSpeed(target, VideoPlaybackSpeeds.NORMAL)
         if (hasBinding) target.pause()
+        target.setActive(true)
         target.setMedia(media)
         when (startOrder) {
             PlaybackStartOrder.PREPARE_THEN_PLAY -> {
@@ -111,11 +120,108 @@ internal class ReusablePlayerLifecycle<Media>(
         hasBinding = false
     }
 
+    /**
+     * Prepares one bounded, silent candidate without changing the active engine. The caller owns
+     * the byte budget and must use a token that changes whenever the target or queue generation
+     * changes.
+     */
+    fun prepareStandby(
+        media: Media,
+        token: String,
+        onPrepare: () -> Unit = {},
+    ): Boolean {
+        if (token.isBlank()) return false
+        val target = standbyEngine ?: factory().also {
+            standbyEngine = it
+            instanceCount += 1
+        }
+        if (standbyHasBinding && standbyToken == token) return true
+        if (standbyHasBinding) {
+            target.pause()
+            target.clearMedia()
+        }
+        standbyToken = null
+        target.setActive(false)
+        target.setPlayWhenReady(false)
+        target.setPlaybackSpeed(VideoPlaybackSpeeds.NORMAL)
+        // Track a partial binding so cancellation also clears a failed setMedia/prepare call.
+        standbyHasBinding = true
+        target.setMedia(media)
+        onPrepare()
+        target.prepare()
+        // A standby engine is never allowed to start playback or acquire audio focus.
+        target.setPlayWhenReady(false)
+        standbyToken = token
+        return true
+    }
+
+    fun hasPreparedStandby(token: String): Boolean =
+        standbyHasBinding && standbyToken == token
+
+    /** Promotes the exact prepared candidate and clears the retired active engine. */
+    fun promotePrepared(
+        token: String,
+        bindingGeneration: Long,
+    ): ReusablePlayerEngine<Media>? {
+        if (!hasPreparedStandby(token)) return null
+        val previousActive = engine
+        val promoted = standbyEngine ?: return null
+        previousActive?.pause()
+        previousActive?.setActive(false)
+        previousActive?.clearMedia()
+        terminateTemporaryPlaybackSpeed(TemporaryPlaybackSpeedTermination.NEW_BINDING)
+        promoted.setPlaybackSpeed(VideoPlaybackSpeeds.NORMAL)
+        engine = promoted
+        standbyEngine = previousActive
+        standbyToken = null
+        standbyHasBinding = false
+        hasBinding = true
+        activeBindingGeneration = bindingGeneration
+        generatedBindingGeneration = maxOf(generatedBindingGeneration, bindingGeneration)
+        return promoted
+    }
+
+    fun clearStandby() {
+        val target = standbyEngine ?: return
+        val hadBinding = standbyHasBinding
+        standbyToken = null
+        standbyHasBinding = false
+        if (hadBinding) {
+            try {
+                target.pause()
+            } finally {
+                target.clearMedia()
+            }
+        }
+    }
+
+    /** A gesture pauses only ACTIVE; the exact next binding must survive until settlement. */
+    fun pauseForPageTransition() {
+        terminateTemporaryPlaybackSpeed(TemporaryPlaybackSpeedTermination.PAGE_UNSTABLE)
+        engine?.pause()
+    }
+
+    fun releaseStandby() {
+        val target = standbyEngine ?: return
+        try {
+            clearStandby()
+        } finally {
+            standbyEngine = null
+            instanceCount -= 1
+            target.release()
+        }
+    }
+
     fun release() {
         terminateTemporaryPlaybackSpeed(TemporaryPlaybackSpeedTermination.RELEASE)
         releaseBinding()
         engine?.release()
         engine = null
+        standbyEngine?.release()
+        standbyEngine = null
+        standbyToken = null
+        standbyHasBinding = false
+        instanceCount = 0
     }
 
     /** Never creates an engine solely to change speed and reports only a verified applied value. */
@@ -275,5 +381,15 @@ internal class StablePlayerViewBinding<View : Any, Player : Any>(
     fun detachActive(): Boolean {
         val view = activeView ?: return false
         return detach(view)
+    }
+
+    fun forActiveView(action: (View) -> Unit) { activeView?.let(action) }
+
+    fun isAttachedTo(player: Player): Boolean = activeView?.let { currentPlayer(it) === player } == true
+
+    fun replacePlayer(player: Player): Boolean {
+        val view = activeView ?: return false
+        setPlayer(view, player)
+        return true
     }
 }

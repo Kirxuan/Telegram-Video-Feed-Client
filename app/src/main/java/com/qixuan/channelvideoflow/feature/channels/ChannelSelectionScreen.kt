@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
@@ -27,17 +28,24 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -54,8 +62,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.toggleableState
 import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.style.TextOverflow
@@ -71,7 +82,6 @@ import com.qixuan.channelvideoflow.model.video.TelegramMessageFailure
 import com.qixuan.channelvideoflow.model.video.VideoScanStatus
 import com.qixuan.channelvideoflow.ui.components.BottomPrimaryAction
 import com.qixuan.channelvideoflow.ui.components.GlossCard
-import com.qixuan.channelvideoflow.ui.components.GlossQuickAction
 import com.qixuan.channelvideoflow.ui.components.GlossSearchField
 import com.qixuan.channelvideoflow.ui.components.PremiumBackdrop
 import com.qixuan.channelvideoflow.ui.components.PremiumTopBar
@@ -94,6 +104,7 @@ internal object ChannelSelectionTestTags {
     const val QuickLogout = "channel-quick-logout"
     const val QuickCache = "channel-quick-cache"
     const val QuickBrowse = "channel-quick-browse"
+    const val Overflow = "channel-overflow"
     fun row(chatId: Long) = "channel-row-$chatId"
 }
 
@@ -156,19 +167,83 @@ fun ChannelSelectionScreen(
     onToggleChannelPinned: (Long) -> Unit = {},
 ) {
     val saveStatus = saveStatusText(uiState.saveStatus)
+    var overflowExpanded by rememberSaveable { mutableStateOf(false) }
     PremiumBackdrop {
         Scaffold(
             containerColor = Color.Transparent,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
-                PremiumTopBar(
-                    title = stringResource(R.string.channels_title),
-                    modifier = Modifier.windowInsetsPadding(
-                        WindowInsets.safeDrawing.only(
-                            WindowInsetsSides.Horizontal + WindowInsetsSides.Top,
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .windowInsetsPadding(
+                            WindowInsets.safeDrawing.only(
+                                WindowInsetsSides.Horizontal + WindowInsetsSides.Top,
+                            ),
                         ),
-                    ),
-                )
+                ) {
+                    PremiumTopBar(
+                        title = stringResource(R.string.channels_title),
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .widthIn(max = RESPONSIVE_CONTENT_MAX_WIDTH),
+                        actions = {
+                            IconButton(
+                                onClick = onOpenCacheSettings,
+                                modifier = Modifier
+                                    .size(ChannelVideoFlowTokens.Sizes.touchTarget)
+                                    .testTag(ChannelSelectionTestTags.QuickCache),
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_settings_outlined),
+                                    contentDescription = stringResource(
+                                        R.string.channels_action_cache_icon,
+                                    ),
+                                )
+                            }
+                            Box {
+                                IconButton(
+                                    onClick = { overflowExpanded = true },
+                                    modifier = Modifier
+                                        .size(ChannelVideoFlowTokens.Sizes.touchTarget)
+                                        .testTag(ChannelSelectionTestTags.Overflow),
+                                ) {
+                                    Icon(
+                                        painter = painterResource(R.drawable.ic_more_vert_outlined),
+                                        contentDescription = stringResource(
+                                            R.string.channels_more_actions,
+                                        ),
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = overflowExpanded,
+                                    onDismissRequest = { overflowExpanded = false },
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text(stringResource(R.string.channels_action_logout)) },
+                                        onClick = {
+                                            overflowExpanded = false
+                                            onLogout()
+                                        },
+                                        enabled = logoutEnabled,
+                                        modifier = Modifier.testTag(
+                                            ChannelSelectionTestTags.QuickLogout,
+                                        ),
+                                        leadingIcon = {
+                                            Icon(
+                                                painter = painterResource(
+                                                    R.drawable.ic_logout_outlined,
+                                                ),
+                                                contentDescription = null,
+                                                tint = glossColors.danger,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        },
+                    )
+                }
             },
             bottomBar = {
                 BottomPrimaryAction(
@@ -186,22 +261,26 @@ fun ChannelSelectionScreen(
                 )
             },
         ) { innerPadding ->
-            ChannelMainList(
-                uiState = uiState,
-                onSearchQueryChanged = onSearchQueryChanged,
-                onToggleChannel = onToggleChannel,
-                onToggleChannelPinned = onToggleChannelPinned,
-                onRetry = onRetry,
-                onPauseScan = onPauseScan,
-                onResumeScan = onResumeScan,
-                onLogout = onLogout,
-                onOpenPlayback = onOpenPlayback,
-                onOpenCacheSettings = onOpenCacheSettings,
-                logoutEnabled = logoutEnabled,
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
-            )
+            ) {
+                ChannelMainList(
+                    uiState = uiState,
+                    onSearchQueryChanged = onSearchQueryChanged,
+                    onToggleChannel = onToggleChannel,
+                    onToggleChannelPinned = onToggleChannelPinned,
+                    onRetry = onRetry,
+                    onPauseScan = onPauseScan,
+                    onResumeScan = onResumeScan,
+                    onOpenPlayback = onOpenPlayback,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxHeight()
+                        .widthIn(max = RESPONSIVE_CONTENT_MAX_WIDTH),
+                )
+            }
         }
     }
 }
@@ -215,10 +294,7 @@ private fun ChannelMainList(
     onRetry: () -> Unit,
     onPauseScan: () -> Unit,
     onResumeScan: () -> Unit,
-    onLogout: () -> Unit,
     onOpenPlayback: () -> Unit,
-    onOpenCacheSettings: () -> Unit,
-    logoutEnabled: Boolean,
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
@@ -232,11 +308,8 @@ private fun ChannelMainList(
         verticalArrangement = Arrangement.spacedBy(ChannelVideoFlowTokens.Spacing.small),
     ) {
         item(key = "quick-actions") {
-            ChannelQuickActions(
+            ChannelBrowseAction(
                 hasIndexedVideos = uiState.scanSummary.indexedVideoCount > 0,
-                logoutEnabled = logoutEnabled,
-                onLogout = onLogout,
-                onOpenCacheSettings = onOpenCacheSettings,
                 onOpenPlayback = onOpenPlayback,
             )
         }
@@ -254,6 +327,12 @@ private fun ChannelMainList(
         }
         item(key = "selection-summary") {
             SelectionSummary(selectedCount = uiState.selectedCount)
+            if (uiState.canSave) {
+                Text(
+                    text = "选择尚未保存：保存后才会切换扫描频道，取消的频道将停止扫描。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
         if (uiState.selectedCount > 0) {
             item(key = "scan-summary") {
@@ -322,47 +401,36 @@ private fun ChannelMainList(
 }
 
 @Composable
-private fun ChannelQuickActions(
+private fun ChannelBrowseAction(
     hasIndexedVideos: Boolean,
-    logoutEnabled: Boolean,
-    onLogout: () -> Unit,
-    onOpenCacheSettings: () -> Unit,
     onOpenPlayback: () -> Unit,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(ChannelVideoFlowTokens.Spacing.small),
+    val label = stringResource(R.string.channels_action_browse)
+    val disabledDescription = stringResource(R.string.channels_action_browse_disabled)
+    Button(
+        onClick = onOpenPlayback,
+        enabled = hasIndexedVideos,
+        modifier = Modifier
+            .fillMaxWidth()
+            .sizeIn(minHeight = ChannelVideoFlowTokens.Sizes.touchTarget)
+            .semantics {
+                role = Role.Button
+                contentDescription = label
+                if (!hasIndexedVideos) {
+                    disabled()
+                    stateDescription = disabledDescription
+                }
+            }
+            .testTag(ChannelSelectionTestTags.QuickBrowse),
+        shape = ChannelVideoFlowTokens.Shapes.control,
     ) {
-        GlossQuickAction(
-            text = stringResource(R.string.channels_action_logout),
-            icon = painterResource(R.drawable.ic_logout_outlined),
-            iconContentDescription = stringResource(R.string.channels_action_logout_icon),
-            onClick = onLogout,
-            enabled = logoutEnabled,
-            accentColor = glossColors.danger,
-            modifier = Modifier
-                .weight(1f)
-                .testTag(ChannelSelectionTestTags.QuickLogout),
+        Icon(
+            painter = painterResource(R.drawable.ic_play_circle_outlined),
+            contentDescription = null,
         )
-        GlossQuickAction(
-            text = stringResource(R.string.channels_action_cache),
-            icon = painterResource(R.drawable.ic_settings_outlined),
-            iconContentDescription = stringResource(R.string.channels_action_cache_icon),
-            onClick = onOpenCacheSettings,
-            modifier = Modifier
-                .weight(1f)
-                .testTag(ChannelSelectionTestTags.QuickCache),
-        )
-        GlossQuickAction(
-            text = stringResource(R.string.channels_action_browse),
-            icon = painterResource(R.drawable.ic_play_circle_outlined),
-            iconContentDescription = stringResource(R.string.channels_action_browse_icon),
-            onClick = onOpenPlayback,
-            enabled = hasIndexedVideos,
-            disabledStateDescription = stringResource(R.string.channels_action_browse_disabled),
-            modifier = Modifier
-                .weight(1f)
-                .testTag(ChannelSelectionTestTags.QuickBrowse),
+        Text(
+            text = label,
+            modifier = Modifier.padding(start = ChannelVideoFlowTokens.Spacing.small),
         )
     }
 }
@@ -379,7 +447,8 @@ private fun SelectionSummary(selectedCount: Int) {
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                val showCompactHint = this@BoxWithConstraints.maxWidth >= 280.dp
+                val showCompactHint = this@BoxWithConstraints.maxWidth >= 280.dp &&
+                    LocalDensity.current.fontScale < 1.5f
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -395,7 +464,7 @@ private fun SelectionSummary(selectedCount: Int) {
                             modifier = Modifier.weight(1f),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
+                            maxLines = Int.MAX_VALUE,
                             overflow = TextOverflow.Ellipsis,
                         )
                     } else {
@@ -414,12 +483,12 @@ private fun SelectionSummary(selectedCount: Int) {
                                     R.string.channels_pin_details_show
                                 },
                             ),
-                            maxLines = 1,
+                            maxLines = Int.MAX_VALUE,
                         )
                     }
                 }
             }
-            if (detailsVisible) {
+            if (detailsVisible || LocalDensity.current.fontScale >= 1.5f) {
                 Text(
                     text = stringResource(R.string.channels_pin_hint),
                     style = MaterialTheme.typography.bodySmall,
@@ -519,7 +588,7 @@ private fun ChannelRow(
             Text(
                 text = channel.title,
                 style = MaterialTheme.typography.bodyLarge,
-                maxLines = 2,
+                maxLines = Int.MAX_VALUE,
                 overflow = TextOverflow.Ellipsis,
             )
             if (metadata.isNotEmpty()) {
@@ -527,7 +596,7 @@ private fun ChannelRow(
                     text = metadata,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
+                    maxLines = Int.MAX_VALUE,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
@@ -576,7 +645,7 @@ private fun ScanProgressPanel(
                             summary.processedVideoCandidateCount,
                         ),
                         style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
+                        maxLines = Int.MAX_VALUE,
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
@@ -586,7 +655,7 @@ private fun ScanProgressPanel(
                         ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
+                        maxLines = Int.MAX_VALUE,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
@@ -605,7 +674,7 @@ private fun ScanProgressPanel(
                                 R.string.channels_scan_details_show
                             },
                         ),
-                        maxLines = 1,
+                        maxLines = Int.MAX_VALUE,
                     )
                 }
                 if (summary.canControl) {
@@ -630,7 +699,7 @@ private fun ScanProgressPanel(
                                     R.string.channels_scan_pause
                                 },
                             ),
-                            maxLines = 1,
+                            maxLines = Int.MAX_VALUE,
                         )
                     }
                 }
@@ -640,11 +709,15 @@ private fun ScanProgressPanel(
                     text = scanFailureText(failure, summary.retrySecondsRemaining),
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
-                    maxLines = if (detailsVisible) Int.MAX_VALUE else 1,
+                    maxLines = Int.MAX_VALUE,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
             if (detailsVisible) {
+                Text(
+                    text = "已折叠 ${summary.duplicateVideoEncounterCount} 次重复视频；已索引为去重后的数量，处理量包含重复及未纳入索引的候选。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Row(
@@ -724,7 +797,7 @@ private fun ChannelScanProgress(channel: ChannelSelectionItem) {
         ),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 1,
+        maxLines = Int.MAX_VALUE,
         overflow = TextOverflow.Ellipsis,
     )
     Text(
@@ -735,7 +808,7 @@ private fun ChannelScanProgress(channel: ChannelSelectionItem) {
         ),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 1,
+        maxLines = Int.MAX_VALUE,
         overflow = TextOverflow.Ellipsis,
     )
 }
@@ -757,13 +830,13 @@ private fun ScanStatistic(
             text = label,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
+            maxLines = Int.MAX_VALUE,
         )
         Text(
             text = value,
             style = MaterialTheme.typography.titleSmall,
             color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
+            maxLines = Int.MAX_VALUE,
             overflow = TextOverflow.Ellipsis,
         )
     }
@@ -911,3 +984,5 @@ private fun FailureText(
         style = MaterialTheme.typography.bodyMedium,
     )
 }
+
+private val RESPONSIVE_CONTENT_MAX_WIDTH = 720.dp

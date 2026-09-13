@@ -55,6 +55,17 @@ data class VideoTagRecord(
     val displayName: String,
 )
 
+data class VideoFeedKeyRow(
+    @ColumnInfo(name = "chat_id")
+    val chatId: Long,
+    @ColumnInfo(name = "message_id")
+    val messageId: Long,
+    @ColumnInfo(name = "publish_time")
+    val publishTime: Long,
+    @ColumnInfo(name = "edit_time")
+    val editTime: Long?,
+)
+
 data class TagSummaryRecord(
     @ColumnInfo(name = "normalized_name")
     val normalizedName: String,
@@ -162,6 +173,87 @@ abstract class VideoIndexDao {
         tagCount = normalizedTags.size,
         tagMode = tagMode.name,
     )
+
+    @Query(
+        """
+        SELECT v.chat_id, v.message_id, v.publish_time, v.edit_time
+        FROM videos v
+        WHERE :channelCount > 0
+          AND v.chat_id IN (:channelIds)
+          AND v.is_deleted = 0
+          AND EXISTS (
+              SELECT 1 FROM channels c
+              WHERE c.chat_id = v.chat_id
+                AND c.is_selected = 1
+                AND c.access_state = :accessState
+          )
+          AND (
+              :tagCount = 0
+              OR (:tagMode = 'OR' AND EXISTS (
+                  SELECT 1 FROM video_tags vt
+                  WHERE vt.chat_id = v.chat_id
+                    AND vt.message_id = v.message_id
+                    AND vt.normalized_tag_name IN (:normalizedTags)
+              ))
+              OR (:tagMode = 'AND' AND (
+                  SELECT COUNT(DISTINCT vt.normalized_tag_name)
+                  FROM video_tags vt
+                  WHERE vt.chat_id = v.chat_id
+                    AND vt.message_id = v.message_id
+                    AND vt.normalized_tag_name IN (:normalizedTags)
+              ) = :tagCount)
+          )
+        ORDER BY v.publish_time DESC, v.chat_id DESC, v.message_id DESC
+        """,
+    )
+    protected abstract fun observeFilteredVideoKeyRows(
+        channelIds: List<Long>,
+        channelCount: Int,
+        normalizedTags: List<String>,
+        tagCount: Int,
+        tagMode: String,
+        accessState: ChannelAccessState = ChannelAccessState.AVAILABLE,
+    ): Flow<List<VideoFeedKeyRow>>
+
+    fun observeFilteredVideoKeys(
+        channelIds: Set<Long>,
+        normalizedTags: Set<String>,
+        tagMode: TagFilterMode,
+    ): Flow<List<VideoFeedKeyRow>> = observeFilteredVideoKeyRows(
+        channelIds = channelIds.sorted(),
+        channelCount = channelIds.size,
+        normalizedTags = normalizedTags.sorted(),
+        tagCount = normalizedTags.size,
+        tagMode = tagMode.name,
+    )
+
+    @Query(
+        """
+        SELECT * FROM videos
+        WHERE chat_id IN (:chatIds)
+          AND message_id IN (:messageIds)
+          AND is_deleted = 0
+        """,
+    )
+    abstract suspend fun getVideosForKeyWindow(
+        chatIds: List<Long>,
+        messageIds: List<Long>,
+    ): List<VideoEntity>
+
+    @Query(
+        """
+        SELECT vt.chat_id, vt.message_id, vt.normalized_tag_name, vt.display_name
+        FROM video_tags vt
+        JOIN videos v ON v.chat_id = vt.chat_id AND v.message_id = vt.message_id
+        WHERE vt.chat_id IN (:chatIds)
+          AND vt.message_id IN (:messageIds)
+          AND v.is_deleted = 0
+        """,
+    )
+    abstract suspend fun getVideoTagsForKeyWindow(
+        chatIds: List<Long>,
+        messageIds: List<Long>,
+    ): List<VideoTagRecord>
 
     @Query(
         """
@@ -275,11 +367,25 @@ abstract class VideoIndexDao {
 
     @Query(
         """
-        UPDATE videos SET is_deleted = 1
+        UPDATE videos SET is_deleted = 1, invalidated_at = :invalidatedAt
         WHERE chat_id = :chatId AND message_id IN (:messageIds)
         """,
     )
-    protected abstract suspend fun markVideosDeleted(chatId: Long, messageIds: List<Long>)
+    protected abstract suspend fun markVideosDeleted(
+        chatId: Long,
+        messageIds: List<Long>,
+        invalidatedAt: Long,
+    )
+
+    @Query(
+        """
+        DELETE FROM videos
+        WHERE is_deleted = 1
+          AND invalidated_at IS NOT NULL
+          AND invalidated_at < :cutoffExclusive
+        """,
+    )
+    protected abstract suspend fun deleteInvalidatedVideosBefore(cutoffExclusive: Long): Int
 
     @Query(
         """
@@ -313,7 +419,9 @@ abstract class VideoIndexDao {
         if (messageIds.isNotEmpty()) {
             duplicateEncounterCount += getExistingMessageIds(page.chatId, messageIds).size
             val persistedVideos = uniqueVideos.values.toList()
-            upsertVideos(persistedVideos.map { it.video.copy(isDeleted = false) })
+            upsertVideos(
+                persistedVideos.map { it.video.copy(isDeleted = false, invalidatedAt = null) },
+            )
             insertTags(
                 persistedVideos
                     .flatMap(PersistedVideo::tags)
@@ -414,7 +522,7 @@ abstract class VideoIndexDao {
 
     @Transaction
     open suspend fun replaceVideoAndTags(persisted: PersistedVideo) {
-        upsertVideos(listOf(persisted.video.copy(isDeleted = false)))
+        upsertVideos(listOf(persisted.video.copy(isDeleted = false, invalidatedAt = null)))
         insertTags(
             persisted.tags.map { tag ->
                 TagEntity(tag.normalizedName, tag.displayName)
@@ -434,18 +542,28 @@ abstract class VideoIndexDao {
     }
 
     @Transaction
-    open suspend fun deleteMessages(chatId: Long, messageIds: List<Long>) {
+    open suspend fun deleteMessages(
+        chatId: Long,
+        messageIds: List<Long>,
+        invalidatedAt: Long,
+    ) {
         if (messageIds.isEmpty()) return
-        markVideosDeleted(chatId, messageIds)
-        deleteVideoTags(chatId, messageIds)
-        deleteOrphanTags()
+        require(invalidatedAt >= 0)
+        markVideosDeleted(chatId, messageIds, invalidatedAt)
     }
 
     @Transaction
-    open suspend fun markUnsupportedEdit(chatId: Long, messageId: Long) {
-        markVideosDeleted(chatId, listOf(messageId))
-        deleteVideoTags(chatId, listOf(messageId))
+    open suspend fun markUnsupportedEdit(chatId: Long, messageId: Long, invalidatedAt: Long) {
+        require(invalidatedAt >= 0)
+        markVideosDeleted(chatId, listOf(messageId), invalidatedAt)
+    }
+
+    @Transaction
+    open suspend fun purgeInvalidatedBefore(cutoffExclusive: Long): Int {
+        require(cutoffExclusive >= 0)
+        val deletedCount = deleteInvalidatedVideosBefore(cutoffExclusive)
         deleteOrphanTags()
+        return deletedCount
     }
 
     @Transaction

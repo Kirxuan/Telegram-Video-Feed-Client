@@ -111,14 +111,40 @@ class VideoIndexDaoTest {
         assertMessages(setOf(2), setOf("学习"), TagFilterMode.OR, 21)
         assertMessages(emptySet(), setOf("学习"), TagFilterMode.OR)
 
-        videoIndexDao.deleteMessages(1, listOf(11))
+        videoIndexDao.deleteMessages(1, listOf(11), clock.incrementAndGet())
         assertMessages(setOf(1, 2), setOf("学习"), TagFilterMode.OR, 21)
         channelDao.markChannelUnavailable(2)
         assertMessages(setOf(1, 2), emptySet(), TagFilterMode.OR, 12)
     }
 
     @Test
-    fun editAtomicallyReplacesCaptionAndTagsAndDeleteRemovesAssociations() = runBlocking {
+    fun lightweightKeysPreserveFilterOrderAndCompositeWindowHydratesExactPairs() = runBlocking {
+        selectChannels(1, 2)
+        listOf(
+            video(1, 10, "学习"),
+            video(1, 20, "学习"),
+            video(2, 10, "学习"),
+            video(2, 30, "其他"),
+        ).forEach { videoIndexDao.replaceVideoAndTags(it) }
+
+        val keys = videoIndexDao.observeFilteredVideoKeys(
+            setOf(1, 2),
+            setOf("学习"),
+            TagFilterMode.OR,
+        ).first()
+        // The fixture's publishTime equals messageId: timestamp 20 precedes 10.
+        // chatId breaks only the equal-timestamp tie; message IDs are not global identities.
+        assertEquals(listOf(1L to 20L, 2L to 10L, 1L to 10L), keys.map { it.chatId to it.messageId })
+
+        val hydrated = videoIndexDao.getVideosForKeyWindow(listOf(1L, 2L), listOf(10L, 30L))
+        assertEquals(
+            setOf(1L to 10L, 2L to 10L, 2L to 30L),
+            hydrated.map { it.chatId to it.messageId }.toSet(),
+        )
+    }
+
+    @Test
+    fun editAtomicallyReplacesCaptionAndSoftDeleteRetainsAssociationsUntilPurge() = runBlocking {
         selectChannels(1)
         videoIndexDao.replaceVideoAndTags(video(1, 10, "旧标签", caption = "旧说明"))
 
@@ -133,10 +159,33 @@ class VideoIndexDaoTest {
             videoIndexDao.getVideoTagsForChannels(listOf(1)).map { it.normalizedTagName }.toSet(),
         )
 
-        videoIndexDao.deleteMessages(1, listOf(10))
-        assertEquals(0, videoIndexDao.getVideoTagRecordCount())
+        val invalidatedAt = clock.incrementAndGet()
+        videoIndexDao.deleteMessages(1, listOf(10), invalidatedAt)
+        assertEquals(2, videoIndexDao.getVideoTagRecordCount())
         assertFalse(videoIndexDao.observeFilteredVideos(setOf(1), emptySet(), TagFilterMode.OR)
             .first().any())
+
+        assertEquals(0, videoIndexDao.purgeInvalidatedBefore(invalidatedAt))
+        assertEquals(1, videoIndexDao.purgeInvalidatedBefore(invalidatedAt + 1))
+        assertEquals(0, videoIndexDao.getVideoTagRecordCount())
+        assertEquals(0, videoIndexDao.getTagRecordCount())
+        assertEquals(0, videoIndexDao.getVideoRecordCount())
+    }
+
+    @Test
+    fun rediscoveredSoftDeletedVideoClearsInvalidationAndSurvivesOldCutoff() = runBlocking {
+        selectChannels(1)
+        val persisted = video(1, 10, "标签")
+        videoIndexDao.replaceVideoAndTags(persisted)
+        videoIndexDao.deleteMessages(1, listOf(10), 2_000)
+
+        videoIndexDao.replaceVideoAndTags(persisted.copy(video = persisted.video.copy(caption = "恢复")))
+
+        val restored = videoIndexDao.getVideo(1, 10)!!
+        assertFalse(restored.isDeleted)
+        assertEquals(null, restored.invalidatedAt)
+        assertEquals(0, videoIndexDao.purgeInvalidatedBefore(3_000))
+        assertEquals(1, videoIndexDao.getVideoRecordCount())
     }
 
     @Test

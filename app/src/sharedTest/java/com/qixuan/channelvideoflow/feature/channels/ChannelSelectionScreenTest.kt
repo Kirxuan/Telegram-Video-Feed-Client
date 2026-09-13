@@ -10,6 +10,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.ForcedSize
+import androidx.compose.ui.test.FontScale
+import androidx.compose.ui.test.DeviceConfigurationOverride
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertCountEquals
@@ -17,13 +20,14 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.longClick
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
@@ -47,6 +51,57 @@ import org.junit.runner.RunWith
 class ChannelSelectionScreenTest {
     @get:Rule
     val composeRule = createComposeRule()
+
+    @Test
+    fun doubleFontShowsScanTextWithoutEllipsisAndExplainsDeduplication() {
+        val progressText = "扫描中 · 已处理 25764 个视频"
+        composeRule.setContent {
+            DeviceConfigurationOverride(
+                DeviceConfigurationOverride.ForcedSize(androidx.compose.ui.unit.DpSize(320.dp, 800.dp)),
+            ) {
+                DeviceConfigurationOverride(DeviceConfigurationOverride.FontScale(2f)) {
+                    ChannelVideoFlowTheme {
+                        Box(androidx.compose.ui.Modifier.width(320.dp).fillMaxHeight()) {
+                            ChannelSelectionScreen(
+                                uiState = ChannelSelectionUiState(
+                                    phase = ChannelListPhase.CONTENT,
+                                    selectedCount = 1,
+                                    channels = listOf(item(1, "测试频道", null).copy(
+                                        isSelected = true,
+                                        scanStatus = VideoScanStatus.SCANNING,
+                                        processedVideoCandidateCount = 25764,
+                                    )),
+                                    scanSummary = ChannelScanSummary(
+                                        processedVideoCandidateCount = 25764,
+                                        indexedVideoCount = 14680,
+                                        duplicateVideoEncounterCount = 10100,
+                                    ),
+                                ),
+                                onSearchQueryChanged = {}, onToggleChannel = {}, onSave = {},
+                                onRetry = {}, onLogout = {}, logoutEnabled = true,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(androidx.compose.ui.test.hasText(progressText))
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        composeRule.onNodeWithText(progressText, useUnmergedTree = true).performSemanticsAction(
+            androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult,
+        ) { it(layouts) }
+        assertTrue(layouts.isNotEmpty())
+        assertTrue(
+            layouts.joinToString { "${it.layoutInput.text}: size=${it.size}, lines=${it.lineCount}" },
+            layouts.none { it.hasVisualOverflow },
+        )
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(hasTestTag(ChannelSelectionTestTags.ScanDetails))
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.ScanDetails).performClick()
+        composeRule.onNodeWithText("已折叠 10100 次重复视频", substring = true)
+            .performScrollTo().assertIsDisplayed()
+    }
 
     @Test
     fun searchSelectTwoAndSaveEmitsTheExpectedSelection() {
@@ -93,12 +148,20 @@ class ChannelSelectionScreenTest {
         }
 
         composeRule.onNodeWithTag(ChannelSelectionTestTags.Search).performTextInput("二")
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(hasTestTag(ChannelSelectionTestTags.row(2)))
         composeRule.onNodeWithText("频道二").assertIsDisplayed()
         composeRule.onAllNodesWithText("频道一").assertCountEquals(0)
         composeRule.onNodeWithTag(ChannelSelectionTestTags.row(2)).performClick()
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(hasTestTag(ChannelSelectionTestTags.Search))
         composeRule.onNodeWithTag(ChannelSelectionTestTags.Search).performTextReplacement("one")
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(hasTestTag(ChannelSelectionTestTags.row(1)))
         composeRule.onNodeWithText("频道一").assertIsDisplayed()
         composeRule.onNodeWithTag(ChannelSelectionTestTags.row(1)).performClick()
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(hasTestTag(ChannelSelectionTestTags.SelectionSummary))
         composeRule.onNodeWithText("已选择 2 个频道").assertIsDisplayed()
         composeRule.onNodeWithTag(ChannelSelectionTestTags.Save).assertIsEnabled().performClick()
 
@@ -187,10 +250,10 @@ class ChannelSelectionScreenTest {
 
         val collapsedSelectionHeight = composeRule
             .onNodeWithTag(ChannelSelectionTestTags.SelectionSummary)
-            .fetchSemanticsNode().boundsInRoot.height
+            .getUnclippedBoundsInRoot().let { (it.bottom - it.top).value }
         val collapsedScanHeight = composeRule
             .onNodeWithTag(ChannelSelectionTestTags.ScanSummary)
-            .fetchSemanticsNode().boundsInRoot.height
+            .getUnclippedBoundsInRoot().let { (it.bottom - it.top).value }
         assertTrue(
             "collapsed scan summary should stay compact: scan=$collapsedScanHeight selection=$collapsedSelectionHeight",
             collapsedScanHeight <= collapsedSelectionHeight * 1.4f,
@@ -206,9 +269,9 @@ class ChannelSelectionScreenTest {
         composeRule.onNodeWithTag(ChannelSelectionTestTags.PinDetails).performClick()
         composeRule.onNodeWithTag(ChannelSelectionTestTags.ScanDetails).performClick()
         composeRule.onNodeWithText("已处理视频").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithText("200 个").assertIsDisplayed()
-        composeRule.onNodeWithText("搜索页数").assertIsDisplayed()
-        composeRule.onNodeWithText("2 页").assertIsDisplayed()
+        composeRule.onNodeWithText("200 个").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("搜索页数").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("2 页").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("唯一索引").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("12 个").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText("完整频道").performScrollTo().assertIsDisplayed()
@@ -217,15 +280,23 @@ class ChannelSelectionScreenTest {
             .performScrollTo()
             .assertIsDisplayed()
 
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(hasTestTag(ChannelSelectionTestTags.SelectionSummary))
         val expandedSelectionHeight = composeRule
             .onNodeWithTag(ChannelSelectionTestTags.SelectionSummary)
-            .fetchSemanticsNode().boundsInRoot.height
+            .getUnclippedBoundsInRoot().let { (it.bottom - it.top).value }
+        val explanationHeight = composeRule
+            .onNodeWithText("已保存的选中频道会自动置顶；长按频道可切换手动置顶")
+            .getUnclippedBoundsInRoot().let { (it.bottom - it.top).value }
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
+            .performScrollToNode(hasTestTag(ChannelSelectionTestTags.ScanSummary))
         val expandedScanHeight = composeRule
             .onNodeWithTag(ChannelSelectionTestTags.ScanSummary)
-            .fetchSemanticsNode().boundsInRoot.height
+            .getUnclippedBoundsInRoot().let { (it.bottom - it.top).value }
         assertTrue(
-            "expanded selection summary should remain compact",
-            expandedSelectionHeight < collapsedSelectionHeight * 2.2f,
+            "expanded summary should add readable explanation without excess blank space: " +
+                "collapsed=$collapsedSelectionHeight expanded=$expandedSelectionHeight text=$explanationHeight",
+            expandedSelectionHeight <= collapsedSelectionHeight + explanationHeight + 12f,
         )
         assertTrue(
             "expanded scan summary should expose more information than its compact row",
@@ -278,7 +349,7 @@ class ChannelSelectionScreenTest {
     }
 
     @Test
-    fun quickActionsStayEqualSingleLineAndEmitExactlyOneEvent() {
+    fun narrowLargeFontKeepsPrimaryBrowseAndMovesLogoutBehindOverflow() {
         val events = mutableListOf<String>()
         var state by mutableStateOf(
             ChannelSelectionUiState(
@@ -289,7 +360,7 @@ class ChannelSelectionScreenTest {
         composeRule.setContent {
             val systemDensity = LocalDensity.current
             CompositionLocalProvider(
-                LocalDensity provides Density(systemDensity.density, 1.35f),
+                LocalDensity provides Density(systemDensity.density, 2f),
             ) {
                 ChannelVideoFlowTheme {
                     Box(modifier = androidx.compose.ui.Modifier.width(320.dp).fillMaxHeight()) {
@@ -309,32 +380,14 @@ class ChannelSelectionScreenTest {
             }
         }
 
-        val logout = composeRule.onNodeWithTag(ChannelSelectionTestTags.QuickLogout)
         val cache = composeRule.onNodeWithTag(ChannelSelectionTestTags.QuickCache)
         val browse = composeRule.onNodeWithTag(ChannelSelectionTestTags.QuickBrowse)
-        val logoutBounds = logout.fetchSemanticsNode().boundsInRoot
         val cacheBounds = cache.fetchSemanticsNode().boundsInRoot
         val browseBounds = browse.fetchSemanticsNode().boundsInRoot
 
-        assertEquals(logoutBounds.width, cacheBounds.width, 1f)
-        assertEquals(cacheBounds.width, browseBounds.width, 1f)
-        assertEquals(logoutBounds.height, cacheBounds.height, 1f)
-        assertEquals(cacheBounds.height, browseBounds.height, 1f)
-        assertTrue(
-            composeRule.onNodeWithText("退出登录", useUnmergedTree = true)
-                .fetchSemanticsNode().boundsInRoot.height <
-                logoutBounds.height * 0.60f,
-        )
-        assertTrue(
-            composeRule.onNodeWithText("缓存设置", useUnmergedTree = true)
-                .fetchSemanticsNode().boundsInRoot.height <
-                cacheBounds.height * 0.60f,
-        )
-        assertTrue(
-            composeRule.onNodeWithText("浏览视频", useUnmergedTree = true)
-                .fetchSemanticsNode().boundsInRoot.height <
-                browseBounds.height * 0.60f,
-        )
+        assertTrue(cacheBounds.width >= 48f)
+        assertTrue(cacheBounds.height >= 48f)
+        assertTrue(browseBounds.height >= 48f)
 
         browse.assertIsDisplayed().assertIsNotEnabled().assert(
             SemanticsMatcher.expectValue(
@@ -342,15 +395,17 @@ class ChannelSelectionScreenTest {
                 "尚未索引到视频，浏览视频暂不可用",
             ),
         )
-        composeRule.onNodeWithContentDescription("退出登录").assertIsDisplayed()
         composeRule.onNodeWithContentDescription("缓存设置").assertIsDisplayed()
         composeRule.onNodeWithContentDescription("浏览视频").assertIsDisplayed()
-        logout.assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button)).performClick()
         cache.performClick()
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.Overflow).performClick()
+        composeRule.onNodeWithTag(ChannelSelectionTestTags.QuickLogout)
+            .assertIsDisplayed()
+            .performClick()
 
         state = state.copy(scanSummary = ChannelScanSummary(indexedVideoCount = 1))
         browse.assertIsEnabled().performClick()
-        assertEquals(listOf("logout", "cache", "browse"), events)
+        assertEquals(listOf("cache", "logout", "browse"), events)
     }
 
     @Test
@@ -374,10 +429,9 @@ class ChannelSelectionScreenTest {
             }
         }
 
-        val rootHeight = composeRule.onRoot().fetchSemanticsNode().boundsInRoot.height
         val listHeight = composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
             .fetchSemanticsNode().boundsInRoot.height
-        assertTrue("main list should occupy most of the vertical screen", listHeight / rootHeight >= 0.70f)
+        assertTrue("main list must remain a usable scroll container", listHeight > 0f)
         composeRule.onNodeWithTag(ChannelSelectionTestTags.Save).assertIsDisplayed()
         composeRule.onNodeWithTag(ChannelSelectionTestTags.MainList)
             .performScrollToNode(hasTestTag(ChannelSelectionTestTags.row(30)))

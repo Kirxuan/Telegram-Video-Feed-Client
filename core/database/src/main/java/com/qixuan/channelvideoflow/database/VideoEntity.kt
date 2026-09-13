@@ -19,6 +19,7 @@ import androidx.room.Index
     indices = [
         Index(value = ["chat_id"]),
         Index(value = ["publish_time", "chat_id", "message_id"]),
+        Index(value = ["is_deleted", "invalidated_at"]),
     ],
 )
 data class VideoEntity(
@@ -49,4 +50,6 @@ data class VideoEntity(
     val isDeleted: Boolean = false,
     @ColumnInfo(name = "indexed_at")
     val indexedAt: Long,
+    @ColumnInfo(name = "invalidated_at")
+    val invalidatedAt: Long? = null,
 )

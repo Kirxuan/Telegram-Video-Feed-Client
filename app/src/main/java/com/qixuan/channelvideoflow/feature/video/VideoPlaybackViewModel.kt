@@ -7,6 +7,8 @@ import androidx.media3.common.util.UnstableApi
 import com.qixuan.channelvideoflow.domain.channel.TelegramChatRepository
 import com.qixuan.channelvideoflow.domain.cache.MediaCacheController
 import com.qixuan.channelvideoflow.domain.message.TelegramMessageRepository
+import com.qixuan.channelvideoflow.domain.message.RepositoryObservationFailure
+import com.qixuan.channelvideoflow.domain.message.VideoFeedKeySnapshot
 import com.qixuan.channelvideoflow.domain.message.VideoReferenceFailure
 import com.qixuan.channelvideoflow.domain.message.VideoReferenceResolution
 import com.qixuan.channelvideoflow.domain.media.DevicePreloadPolicySource
@@ -14,12 +16,15 @@ import com.qixuan.channelvideoflow.domain.media.NetworkTransport
 import com.qixuan.channelvideoflow.domain.media.NoOpStreamingNetworkMetricsRepository
 import com.qixuan.channelvideoflow.domain.media.PreloadOwnerHandoffPhase
 import com.qixuan.channelvideoflow.domain.media.StreamingNetworkMetricsRepository
+import com.qixuan.channelvideoflow.domain.media.OriginalPlaybackAdmission
 import com.qixuan.channelvideoflow.domain.media.VideoQualitySelector
 import com.qixuan.channelvideoflow.domain.media.VideoPreloadController
-import com.qixuan.channelvideoflow.domain.video.VideoPlaybackQueue
+import com.qixuan.channelvideoflow.domain.video.PlaybackFeedRoundEntry
+import com.qixuan.channelvideoflow.domain.video.PlaybackFeedSession
+import com.qixuan.channelvideoflow.domain.video.PlaybackFeedSnapshot
 import com.qixuan.channelvideoflow.domain.video.VideoFeedOnboardingPreferences
-import com.qixuan.channelvideoflow.domain.video.RandomRoundEntry
 import com.qixuan.channelvideoflow.model.video.DEFAULT_VIDEO_FEED_ORDER
+import com.qixuan.channelvideoflow.model.video.IndexedVideo
 import com.qixuan.channelvideoflow.model.video.OriginalMessageLinkResult
 import com.qixuan.channelvideoflow.model.video.TagFilterMode
 import com.qixuan.channelvideoflow.model.video.VideoFeedOrder
@@ -31,6 +36,7 @@ import com.qixuan.channelvideoflow.player.PlaybackPlanRefreshOutcome
 import com.qixuan.channelvideoflow.player.PlaybackTransitionDirection
 import com.qixuan.channelvideoflow.player.PlaybackTransitionEvent
 import com.qixuan.channelvideoflow.player.TransparentRecoveryOutcome
+import com.qixuan.channelvideoflow.player.PlaybackPreparationContext
 import com.qixuan.channelvideoflow.player.VideoPlaybackController
 import com.qixuan.channelvideoflow.player.VideoPlaybackFailure
 import com.qixuan.channelvideoflow.player.VideoPlaybackState
@@ -72,7 +78,7 @@ class VideoPlaybackViewModel private constructor(
     private val cacheController: MediaCacheController,
     private val devicePolicySource: DevicePreloadPolicySource,
     private val onboardingPreferences: VideoFeedOnboardingPreferences,
-    private val playbackQueue: VideoPlaybackQueue,
+    private val feedSession: PlaybackFeedSession,
     private val networkMetrics: StreamingNetworkMetricsRepository,
 ) : ViewModel() {
     @Inject
@@ -93,7 +99,7 @@ class VideoPlaybackViewModel private constructor(
         cacheController = cacheController,
         devicePolicySource = devicePolicySource,
         onboardingPreferences = onboardingPreferences,
-        playbackQueue = VideoPlaybackQueue(),
+        feedSession = PlaybackFeedSession(),
         networkMetrics = networkMetrics,
     )
 
@@ -104,7 +110,7 @@ class VideoPlaybackViewModel private constructor(
         preloadController: VideoPreloadController,
         cacheController: MediaCacheController,
         devicePolicySource: DevicePreloadPolicySource,
-        playbackQueue: VideoPlaybackQueue,
+        feedSession: PlaybackFeedSession,
         onboardingPreferences: VideoFeedOnboardingPreferences,
         networkMetrics: StreamingNetworkMetricsRepository =
             NoOpStreamingNetworkMetricsRepository,
@@ -117,7 +123,7 @@ class VideoPlaybackViewModel private constructor(
         cacheController = cacheController,
         devicePolicySource = devicePolicySource,
         onboardingPreferences = onboardingPreferences,
-        playbackQueue = playbackQueue,
+        feedSession = feedSession,
         networkMetrics = networkMetrics,
     )
 
@@ -128,15 +134,24 @@ class VideoPlaybackViewModel private constructor(
         mutablePlaybackProgress.asStateFlow()
 
     private val criteria = MutableStateFlow(FeedCriteria())
+    private val feedObservationRetry = MutableStateFlow(0L)
     private val mutableOpenOriginalMessageLinks = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val openOriginalMessageLinks: SharedFlow<String> = mutableOpenOriginalMessageLinks.asSharedFlow()
 
     private var items = emptyList<FeedVideoItem>()
+    private val hydratedVideos = linkedMapOf<VideoKey, com.qixuan.channelvideoflow.model.video.IndexedVideo>()
+    private var feedSnapshot = feedSession.current()
+    private var currentFeedKeySet = emptySet<VideoKey>()
+    private var upcomingFeedKeySet = emptySet<VideoKey>()
+    private var hydrationJob: Job? = null
+    private var hydrationRequestGeneration = 0L
+    private var uiHydrationGeneration = 0L
     private var playerSnapshot = VideoPlayerSnapshot()
     private var currentPage = 0
     private var sourceLoaded = false
+    private var keyObservationFailure: RepositoryObservationFailure? = null
+    private var feedObservationFailure: RepositoryObservationFailure? = null
     private var lastAppliedSource: FeedSource? = null
-    private var latestSourceVideos = emptyList<com.qixuan.channelvideoflow.model.video.IndexedVideo>()
     private var latestChannelTitles = emptyMap<Long, String>()
     private var randomRoundStartPagerPage: Int? = null
     private var queueGeneration = 0L
@@ -149,16 +164,11 @@ class VideoPlaybackViewModel private constructor(
         QualitySelection(
             preference = preference,
             network = signals.network,
-            availableBandwidthBitsPerSecond = networkMetrics.estimate.value
-                ?.availableBitsPerSecond
-                ?.takeIf { preference == VideoQualityPreference.AUTO },
+            networkGeneration = signals.networkGeneration,
         )
     }
     private val playbackPlans = AtomicReference(PlaybackPlanSlots())
-    private var pagerIsUnstable = false
-    private var pendingPointerDownAtMillis: Long? = null
-    private var unstableTarget: QueueTarget? = null
-    private var lastSettledPage: SettledPage? = null
+    private val targetCoordinator = PlaybackTargetCoordinator()
     private var stablePageGeneration = 0L
     private var planPreparationGeneration = 0L
     private var stablePageJob: Job? = null
@@ -176,6 +186,8 @@ class VideoPlaybackViewModel private constructor(
     private var swipeHintHandledThisSession = false
     private var swipeHintMarkStarted = false
     private var swipeHintTimeoutJob: Job? = null
+    private var pendingOriginalPlayback: Pair<IndexedVideo, PlaybackPlanToken>? = null
+    private var approvedOriginalPlayback: Pair<VideoKey, Int>? = null
     private var isForeground = true
 
     init {
@@ -195,7 +207,7 @@ class VideoPlaybackViewModel private constructor(
             }
         }
         viewModelScope.launch {
-            combine(chatRepository.channels, criteria) { channels, selection ->
+            combine(chatRepository.channels, criteria, feedObservationRetry) { channels, selection, retryToken ->
                 val channelIds = selection.channelIds ?: channels
                     .asSequence()
                     .filter { channel -> channel.isSelected }
@@ -209,15 +221,16 @@ class VideoPlaybackViewModel private constructor(
                     ),
                     order = selection.order,
                     channelTitles = channels.associate { channel -> channel.chatId to channel.title },
+                    retryToken = retryToken,
                 )
             }
                 .distinctUntilChanged()
                 .flatMapLatest { source ->
-                    messageRepository.observeVideos(source.filter).map { videos ->
-                        FeedSourceResult(source, videos)
+                    messageRepository.observeVideoKeyObservation(source.filter).map { observation ->
+                        FeedSourceResult(source, observation.value, observation.failure)
                     }
                 }
-                .collect { result -> reconcileFeed(result) }
+                .collect { result -> reconcileFeedKeys(result) }
         }
         viewModelScope.launch {
             playerController.snapshot.collect { snapshot ->
@@ -251,15 +264,12 @@ class VideoPlaybackViewModel private constructor(
             combine(
                 cacheController.state.map { state -> state.videoQualityPreference },
                 devicePolicySource.signals,
-                networkMetrics.estimate,
-            ) { preference, signals, _ ->
+            ) { preference, signals ->
                 networkMetrics.resetNetworkContext(signals.network, signals.networkGeneration)
                 QualitySelection(
                     preference = preference,
                     network = signals.network,
-                    availableBandwidthBitsPerSecond = networkMetrics.estimate.value
-                        ?.availableBitsPerSecond
-                        ?.takeIf { preference == VideoQualityPreference.AUTO },
+                    networkGeneration = signals.networkGeneration,
                 )
             }
                 .distinctUntilChanged()
@@ -269,9 +279,48 @@ class VideoPlaybackViewModel private constructor(
                     qualitySelectionGeneration += 1L
                     cancelTransparentRecovery(clearAttempt = true)
                     invalidatePlaybackPlans()
-                    if (isForeground && playerSnapshot.hasRenderedFirstFrame && !pagerIsUnstable) {
+                    val bound = when (val state = playerSnapshot.playbackState) {
+                        is VideoPlaybackState.Loading -> state.video
+                        is VideoPlaybackState.Ready -> state.video
+                        else -> null
+                    }
+                    if (bound != null && needsOriginalConfirmation(bound)) admitOriginalPlayback(bound)
+                    if (
+                        isForeground &&
+                        playerSnapshot.hasRenderedFirstFrame &&
+                        !targetCoordinator.state.isUnstable
+                    ) {
                         prepareNextVideoPlan()
                     }
+                }
+        }
+        viewModelScope.launch {
+            networkMetrics.estimate.map { it?.availableBitsPerSecond }
+                .distinctUntilChanged()
+                .collect { bandwidth ->
+                    if (bandwidth == null || qualitySelection.preference != VideoQualityPreference.AUTO) {
+                        return@collect
+                    }
+                    // A throughput sample is not a new playback identity. Keep in-flight
+                    // preparation and prepared bytes unless the selected representation changes.
+                    val next = nextTarget() ?: return@collect
+                    val plan = playbackPlans.get().next ?: return@collect
+                    if (!plan.matches(next.video.key, currentPlanToken(next.randomEntry?.roundGeneration))) {
+                        return@collect
+                    }
+                    val selected = selectStandbyVideo(
+                        plan.toVideo(next.video).copy(alternativeVariants = plan.availableVariants),
+                        qualitySelection,
+                    )
+                    if (selected.playbackFileId == plan.playbackFileId &&
+                        selected.selectedAlternative == plan.selectedAlternative
+                    ) return@collect
+                    // Once a gesture has committed to a prepared target, let its exact plan
+                    // finish. Future plans still sample the latest throughput below.
+                    if (!isForeground || targetCoordinator.state.isUnstable) return@collect
+                    qualitySelectionGeneration += 1L
+                    invalidatePlaybackPlans()
+                    if (playerSnapshot.hasRenderedFirstFrame) prepareNextVideoPlan()
                 }
         }
     }
@@ -279,15 +328,15 @@ class VideoPlaybackViewModel private constructor(
     /** Called by the pager as soon as it starts moving, before the target is stable. */
     fun onPageUnstable() {
         playerController.setTemporaryPlaybackSpeed(active = false)
-        if (pagerIsUnstable) return
-        pagerIsUnstable = true
-        unstableTarget = null
-        val pointerDownAtMillis = pendingPointerDownAtMillis
+        val decision = targetCoordinator.dispatch(PlaybackTargetIntent.PageBecameUnstable)
+        val started = decision as? PlaybackTargetDecision.TransitionStarted ?: return
+        pendingOriginalPlayback = null
+        rebuildUiState()
         playerController.recordTransition(
-            if (pointerDownAtMillis == null) {
+            if (started.pointerDownAtMillis == null) {
                 PlaybackTransitionEvent.PageUnstable
             } else {
-                PlaybackTransitionEvent.GestureStarted(pointerDownAtMillis)
+                PlaybackTransitionEvent.GestureStarted(started.pointerDownAtMillis)
             },
         )
         stablePageGeneration += 1
@@ -301,24 +350,26 @@ class VideoPlaybackViewModel private constructor(
 
     fun onPagerPointerDown(observedAtMillis: Long) {
         recordSwipeHintInteraction()
-        if (pendingPointerDownAtMillis != null) return
-        pendingPointerDownAtMillis = observedAtMillis
-        if (pagerIsUnstable) {
+        val decision = targetCoordinator.dispatch(
+            PlaybackTargetIntent.PointerDown(observedAtMillis),
+        ) as? PlaybackTargetDecision.PointerStarted ?: return
+        if (decision.whileUnstable) {
             playerController.recordTransition(
                 PlaybackTransitionEvent.GestureStarted(observedAtMillis),
             )
-            unstableTarget = null
             cancelPlanPreparation(clearNextPlan = false)
         }
     }
 
     fun onPagerPointerReleased(observedAtMillis: Long) {
-        if (pagerIsUnstable && pendingPointerDownAtMillis != null) {
+        val decision = targetCoordinator.dispatch(
+            PlaybackTargetIntent.PointerReleased(observedAtMillis),
+        )
+        if (decision is PlaybackTargetDecision.PointerFinished) {
             playerController.recordTransition(
                 PlaybackTransitionEvent.GestureReleased(observedAtMillis),
             )
         }
-        pendingPointerDownAtMillis = null
     }
 
     /**
@@ -326,37 +377,42 @@ class VideoPlaybackViewModel private constructor(
      * It never binds the shared player; binding remains gated by [onPageSettled].
      */
     fun onPageTargeted(pagerPage: Int, logicalPage: Int) {
-        if (!pagerIsUnstable) return
-        val target = resolveQueueTarget(pagerPage, logicalPage) ?: return
+        val keyTarget = resolveQueueKeyTarget(pagerPage, logicalPage) ?: return
+        val target = hydrateQueueTarget(keyTarget) ?: run {
+            scheduleHydration(keyTarget) { onPageTargeted(pagerPage, logicalPage) }
+            return
+        }
         val item = buildItem(target.video)
-        val previousTarget = unstableTarget
-        unstableTarget = target
-        val currentKey = items.getOrNull(currentPage)?.video?.key
-        if (item.video.key == currentKey) {
-            if (previousTarget != null && !previousTarget.samePosition(target)) {
-                if (pendingPointerDownAtMillis == null) {
-                    // targetPage may bounce to the old page during release/fling hand-off.
-                    // settledPage is authoritative once direct manipulation has ended.
-                    unstableTarget = previousTarget
-                    return
-                }
+        val currentKey = currentItem()?.video?.key
+        val decision = targetCoordinator.dispatch(
+            PlaybackTargetIntent.Targeted(
+                target = target.toIdentity(pagerPage, logicalPage),
+                currentKey = currentKey,
+            ),
+        ) as? PlaybackTargetDecision.TargetEvaluated ?: return
+        when (decision.outcome) {
+            PlaybackTargetOutcome.BOUNCE_TO_CURRENT_IGNORED,
+            PlaybackTargetOutcome.CURRENT_TARGET,
+            -> return
+            PlaybackTargetOutcome.CURRENT_TARGET_ABANDONED -> {
                 playerController.recordTransition(PlaybackTransitionEvent.TargetAbandoned)
                 preloadController.abandonTargetPromotion()
                 cancelPlanPreparation(clearNextPlan = true)
+                return
             }
-            return
-        }
-        if (previousTarget?.samePosition(target) != true) {
-            val replacesExistingCandidate =
-                previousTarget?.video?.key != null && previousTarget.video.key != currentKey
-            val replacesForwardCandidate = nextTarget()?.samePosition(target) != true
-            if (replacesExistingCandidate || replacesForwardCandidate) {
-                preloadController.setNextVideo(null)
+            PlaybackTargetOutcome.EXISTING_TARGET -> Unit
+            PlaybackTargetOutcome.NEW_TARGET -> {
+                val replacesExistingCandidate =
+                    decision.previous?.key != null && decision.previous.key != currentKey
+                val replacesForwardCandidate = nextTarget()?.samePosition(decision.target) != true
+                if (replacesExistingCandidate || replacesForwardCandidate) {
+                    preloadController.setNextVideo(null)
+                }
+                playerController.recordTransition(targetKnownEvent(target, pagerPage))
+                playerController.recordTransition(
+                    PlaybackTransitionEvent.PlanPreparationStarted(item.video.key),
+                )
             }
-            playerController.recordTransition(targetKnownEvent(target, pagerPage))
-            playerController.recordTransition(
-                PlaybackTransitionEvent.PlanPreparationStarted(item.video.key),
-            )
         }
         preloadController.commitTargetPromotion(promotionVideo(target))
         ensurePlanPreparation(target)
@@ -364,16 +420,21 @@ class VideoPlaybackViewModel private constructor(
 
     /** Only the latest settled page is allowed to bind the shared player. */
     fun onPageSettled(pagerPage: Int, logicalPage: Int) {
-        val reportedTarget = resolveQueueTarget(pagerPage, logicalPage) ?: return
+        val keyTarget = resolveQueueKeyTarget(pagerPage, logicalPage) ?: return
+        val reportedTarget = hydrateQueueTarget(keyTarget) ?: run {
+            scheduleHydration(keyTarget) { onPageSettled(pagerPage, logicalPage) }
+            return
+        }
         val reportedItem = buildItem(reportedTarget.video)
         val reportedSettledEvent = pageSettledEvent(reportedTarget, pagerPage)
-        val expectedTarget = unstableTarget
-        if (
-            pagerIsUnstable &&
-            expectedTarget != null &&
-            !reportedTarget.samePosition(expectedTarget)
-        ) {
-            if (reportedItem.video.key == items.getOrNull(currentPage)?.video?.key) {
+        val decision = targetCoordinator.dispatch(
+            PlaybackTargetIntent.Settled(
+                target = reportedTarget.toIdentity(pagerPage, logicalPage),
+                queueGeneration = playbackQueueGeneration,
+            ),
+        ) as PlaybackTargetDecision.PageSettled
+        if (decision.expectedTargetMismatch) {
+            if (reportedItem.video.key == currentItem()?.video?.key) {
                 playerController.recordTransition(PlaybackTransitionEvent.TargetAbandoned)
             } else {
                 playerController.recordTransition(
@@ -382,34 +443,35 @@ class VideoPlaybackViewModel private constructor(
             }
             preloadController.abandonTargetPromotion()
             cancelPlanPreparation(clearNextPlan = true)
-            unstableTarget = reportedTarget
         }
-        val wasUnstable = pagerIsUnstable
-        pagerIsUnstable = false
-        pendingPointerDownAtMillis = null
-        unstableTarget = null
+        val wasUnstable = decision.wasUnstable
         val settledTarget = if (reportedTarget.randomEntry == null) {
+            feedSnapshot = feedSession.settle(logicalPage)
             reportedTarget
         } else {
-            val previousGeneration = playbackQueue.randomRoundState?.current?.generation
-            val settledState = playbackQueue.settleRandom(reportedTarget.randomEntry)
-            if (settledState.current.generation != previousGeneration) {
-                items = buildItems(settledState.current.items, latestChannelTitles)
+            val previousGeneration = feedSnapshot.roundGeneration
+            val settledState = feedSession.settleRandom(reportedTarget.randomEntry)
+            feedSnapshot = settledState
+            currentFeedKeySet = settledState.keys.toHashSet()
+            upcomingFeedKeySet = settledState.upcoming?.keys.orEmpty().toHashSet()
+            if (settledState.roundGeneration != previousGeneration) {
+                items = buildItemsFromKeys(
+                    hydratedVideos.keys.filter(currentFeedKeySet::contains),
+                    latestChannelTitles,
+                )
                 randomRoundStartPagerPage = pagerPage - reportedTarget.randomEntry.index
             } else if (randomRoundStartPagerPage == null) {
                 randomRoundStartPagerPage = pagerPage - reportedTarget.randomEntry.index
             }
-            val currentEntry = settledState.current.entry(settledState.currentIndex)
-            QueueTarget(currentEntry.video, currentEntry)
+            val currentEntry = requireNotNull(settledState.currentEntry())
+            QueueTarget(
+                video = requireNotNull(hydratedVideos[currentEntry.key]),
+                randomEntry = currentEntry,
+            )
         }
         val item = buildItem(settledTarget.video)
-        val settledPage = SettledPage(
-            pagerPage = pagerPage,
-            key = item.video.key,
-            queueGeneration = playbackQueueGeneration,
-        )
-        if (!wasUnstable && lastSettledPage == settledPage) return
-        lastSettledPage = settledPage
+        if (decision.duplicate) return
+        if (approvedOriginalPlayback?.first != item.video.key) approvedOriginalPlayback = null
         playerController.recordTransition(reportedSettledEvent)
         currentPage = reportedTarget.randomEntry?.index ?: logicalPage
         if (
@@ -434,7 +496,7 @@ class VideoPlaybackViewModel private constructor(
         stablePageJob = viewModelScope.launch {
             if (
                 requestGeneration != stablePageGeneration ||
-                items.getOrNull(currentPage)?.video?.key != item.video.key
+                currentItem()?.video?.key != item.video.key
             ) {
                 return@launch
             }
@@ -476,12 +538,12 @@ class VideoPlaybackViewModel private constructor(
                     ),
                 )
             }
-            val currentItem = items.getOrNull(currentPage)
+            val currentItem = currentItem()
             val terminalFailure = plan?.terminalFailure
             if (
                 terminalFailure != null &&
-                lastSettledPage?.key == item.video.key &&
-                !pagerIsUnstable
+                targetCoordinator.state.lastSettled?.key == item.video.key &&
+                !targetCoordinator.state.isUnstable
             ) {
                 planPreparation = null
                 preloadController.stop()
@@ -512,6 +574,7 @@ class VideoPlaybackViewModel private constructor(
             }
         }
         rebuildUiState()
+        scheduleHydration(feedSnapshot.currentIndex)
     }
 
     fun togglePause() {
@@ -529,11 +592,11 @@ class VideoPlaybackViewModel private constructor(
             return
         }
         val ready = playerSnapshot.playbackState as? VideoPlaybackState.Ready
-        val currentKey = items.getOrNull(currentPage)?.video?.key
+        val currentKey = currentItem()?.video?.key
         val canActivate = ready != null &&
             ready.video.key == currentKey &&
-            lastSettledPage?.key == currentKey &&
-            !pagerIsUnstable &&
+            targetCoordinator.state.lastSettled?.key == currentKey &&
+            !targetCoordinator.state.isUnstable &&
             playerSnapshot.hasRenderedFirstFrame &&
             playerSnapshot.isPlaying &&
             !playerSnapshot.isPaused
@@ -579,7 +642,7 @@ class VideoPlaybackViewModel private constructor(
             }
             when (resolution) {
                 is VideoReferenceResolution.Resolved -> {
-                    val currentItem = items.getOrNull(currentPage)
+                    val currentItem = currentItem()
                     if (
                         requestGeneration != stablePageGeneration ||
                         currentItem?.video?.key != failedKey ||
@@ -587,7 +650,8 @@ class VideoPlaybackViewModel private constructor(
                     ) {
                         return@launch
                     }
-                    playerController.bind(selectPlaybackVideo(resolution.video, token.selection))
+                    val video = selectPlaybackVideo(resolution.video, token.selection)
+                    if (admitOriginalPlayback(video)) playerController.bind(video, poolContext(token))
                 }
                 VideoReferenceResolution.MessageMissing,
                 VideoReferenceResolution.UnsupportedMessage,
@@ -599,6 +663,10 @@ class VideoPlaybackViewModel private constructor(
         }
     }
 
+    fun retryFeedObservation() {
+        feedObservationRetry.value += 1L
+    }
+
     private fun isManualRetryPresentationCurrent(
         failedKey: VideoKey,
         retryRequestGeneration: Long,
@@ -607,7 +675,7 @@ class VideoPlaybackViewModel private constructor(
         val failed = playerSnapshot.playbackState as? VideoPlaybackState.Failed ?: return false
         return retryRequestGeneration == retryGeneration &&
             retryJob?.isActive == true &&
-            !pagerIsUnstable &&
+            !targetCoordinator.state.isUnstable &&
             failed.reason == VideoPlaybackFailure.FILE_UNAVAILABLE &&
             failed.video.key == failedKey &&
             token.qualitySelectionGeneration == qualitySelectionGeneration &&
@@ -655,8 +723,20 @@ class VideoPlaybackViewModel private constructor(
         )
     }
 
+    fun setFeedSource(filter: VideoFilter, order: VideoFeedOrder) {
+        val next = FeedCriteria(
+            channelIds = filter.channelIds,
+            normalizedTags = filter.normalizedTags,
+            tagMode = filter.tagMode,
+            order = order,
+        )
+        if (criteria.value == next) return
+        stopOldFeedRequests()
+        criteria.value = next
+    }
+
     fun requestOriginalMessageLink() {
-        val item = items.getOrNull(currentPage) ?: return
+        val item = currentItem() ?: return
         linkJob?.cancel()
         rebuildUiState(originalMessageLink = OriginalMessageLinkUiState.Loading)
         linkJob = viewModelScope.launch {
@@ -689,6 +769,8 @@ class VideoPlaybackViewModel private constructor(
     }
 
     fun releasePage() {
+        pendingOriginalPlayback = null
+        approvedOriginalPlayback = null
         playerController.setTemporaryPlaybackSpeed(active = false)
         dismissSwipeHintIfVisible()
         accountGeneration += 1L
@@ -700,6 +782,9 @@ class VideoPlaybackViewModel private constructor(
         retryJob?.cancel()
         retryJob = null
         cancelTransparentRecovery(clearAttempt = true)
+        hydrationRequestGeneration += 1L
+        hydrationJob?.cancel()
+        hydrationJob = null
         preloadController.stop()
         playerController.release()
         viewModelScope.launch { cacheController.trimToLimit() }
@@ -710,7 +795,13 @@ class VideoPlaybackViewModel private constructor(
         super.onCleared()
     }
 
-    private fun reconcileFeed(result: FeedSourceResult) {
+    private fun reconcileFeedKeys(result: FeedSourceResult) {
+        if (result.failure != null && result.rows.isEmpty() && feedSnapshot.keys.isNotEmpty()) {
+            sourceLoaded = true
+            feedObservationFailure = result.failure
+            rebuildUiState()
+            return
+        }
         val sourceChanged = lastAppliedSource?.let { previous ->
             previous.filter != result.source.filter || previous.order != result.source.order
         } ?: true
@@ -719,60 +810,49 @@ class VideoPlaybackViewModel private constructor(
             queueGeneration += 1
             currentPage = 0
             randomRoundStartPagerPage = null
+            feedSession.reset()
         }
         lastAppliedSource = result.source
         sourceLoaded = true
-        latestSourceVideos = result.videos
+        keyObservationFailure = result.failure
+        feedObservationFailure = result.failure
         latestChannelTitles = result.source.channelTitles
 
-        val previousRandomState = playbackQueue.randomRoundState
-        val randomState = if (result.source.order == VideoFeedOrder.RANDOM) {
-            if (sourceChanged) {
-                playbackQueue.startRandomSession(result.videos)
-            } else {
-                playbackQueue.reconcileRandomSession(result.videos)
-            }
-        } else {
-            null
+        val previousSnapshot = feedSnapshot
+        feedSnapshot = feedSession.replace(result.rows, result.source.order)
+        currentFeedKeySet = feedSnapshot.keys.toHashSet()
+        upcomingFeedKeySet = feedSnapshot.upcoming?.keys.orEmpty().toHashSet()
+        val currentAndUpcomingKeys = buildSet {
+            addAll(currentFeedKeySet)
+            addAll(upcomingFeedKeySet)
         }
-        val orderedVideos = randomState?.current?.items
-            ?: playbackQueue.rebuild(result.videos, result.source.order)
-        val rebuiltItems = buildItems(orderedVideos, result.source.channelTitles)
-        val randomSessionMetadataChanged = randomState != null && previousRandomState != null &&
-            (
-                previousRandomState.current.items != randomState.current.items ||
-                    previousRandomState.upcoming?.items != randomState.upcoming?.items
-                )
-        val randomSessionStructureChanged = randomState != null && previousRandomState != null &&
-            (
-                previousRandomState.current.generation != randomState.current.generation ||
-                    previousRandomState.upcoming?.generation != randomState.upcoming?.generation ||
-                    previousRandomState.current.items.map { video -> video.key } !=
-                    randomState.current.items.map { video -> video.key } ||
-                    previousRandomState.upcoming?.items?.map { video -> video.key } !=
-                    randomState.upcoming?.items?.map { video -> video.key }
-                )
+        val rebuiltItems = items.mapNotNull { item ->
+            item.video.key.takeIf(currentFeedKeySet::contains)
+                ?.let(hydratedVideos::get)
+                ?.let { video -> buildItem(video, result.source.channelTitles) }
+        }
+        val randomSessionStructureChanged =
+            previousSnapshot.roundGeneration != feedSnapshot.roundGeneration ||
+                previousSnapshot.upcoming?.generation != feedSnapshot.upcoming?.generation ||
+                previousSnapshot.upcoming?.keys != feedSnapshot.upcoming?.keys
         val queueStructureChanged = !sourceChanged &&
             (
-                rebuiltItems.map { item -> item.video.key } != items.map { item -> item.video.key } ||
+                previousSnapshot.keys != feedSnapshot.keys ||
                     randomSessionStructureChanged
                 )
         val queueMetadataChanged = !sourceChanged && !queueStructureChanged &&
-            (
-                rebuiltItems.map(FeedVideoItem::video) != items.map(FeedVideoItem::video) ||
-                    randomSessionMetadataChanged
-                )
+            rebuiltItems.map(FeedVideoItem::video) != items.map(FeedVideoItem::video)
         val recoveryKey = transparentRecoveryAttempt?.key?.videoKey
         val preserveRemovedCurrentRecovery = queueStructureChanged &&
             recoveryKey != null &&
-            rebuiltItems.none { item -> item.video.key == recoveryKey } &&
+            recoveryKey !in currentAndUpcomingKeys &&
             playerSnapshot.playbackState.videoKeyOrNull() == recoveryKey
-        val resolvingSettledKey = lastSettledPage?.key?.takeIf { key ->
+        val resolvingSettledKey = targetCoordinator.state.lastSettled?.key?.takeIf { key ->
             activeReferenceResolutionCounts[key]?.let { count -> count > 0 } == true
         }
         val preserveRemovedCurrentPlan = queueStructureChanged &&
             resolvingSettledKey != null &&
-            rebuiltItems.none { item -> item.video.key == resolvingSettledKey } &&
+            resolvingSettledKey !in currentAndUpcomingKeys &&
             stablePageJob?.isActive == true
         val retryingFailedKey = (playerSnapshot.playbackState as? VideoPlaybackState.Failed)
             ?.takeIf { failed -> failed.reason == VideoPlaybackFailure.FILE_UNAVAILABLE }
@@ -780,7 +860,7 @@ class VideoPlaybackViewModel private constructor(
             ?.key
         val preserveRemovedCurrentRetry = queueStructureChanged &&
             retryingFailedKey != null &&
-            rebuiltItems.none { item -> item.video.key == retryingFailedKey } &&
+            retryingFailedKey !in currentAndUpcomingKeys &&
             retryJob?.isActive == true
         val messageUnavailableKey = (playerSnapshot.playbackState as? VideoPlaybackState.Failed)
             ?.takeIf { failed -> failed.reason == VideoPlaybackFailure.MESSAGE_UNAVAILABLE }
@@ -788,7 +868,7 @@ class VideoPlaybackViewModel private constructor(
             ?.key
         val preserveRemovedMessageUnavailable = queueStructureChanged &&
             messageUnavailableKey != null &&
-            rebuiltItems.none { item -> item.video.key == messageUnavailableKey }
+            messageUnavailableKey !in currentAndUpcomingKeys
         val preserveRemovedCurrentPresentation =
             preserveRemovedCurrentRecovery || preserveRemovedCurrentPlan ||
                 preserveRemovedCurrentRetry || preserveRemovedMessageUnavailable
@@ -807,18 +887,17 @@ class VideoPlaybackViewModel private constructor(
             reconcilePlaybackPlansWith(rebuiltItems)
         }
         items = rebuiltItems
-        if (randomState != null) {
-            randomRoundStartPagerPage = if (randomState.current.items.isEmpty()) {
+        if (feedSnapshot.order == VideoFeedOrder.RANDOM) {
+            randomRoundStartPagerPage = if (feedSnapshot.keys.isEmpty()) {
                 null
             } else {
-                lastSettledPage?.pagerPage?.minus(randomState.currentIndex)
+                targetCoordinator.state.lastSettled?.pagerPage?.minus(feedSnapshot.currentIndex)
                     ?: randomRoundStartPagerPage
             }
         }
 
-        val currentVideoStillExists = items.any { item ->
-            item.video.key == playerSnapshot.playbackState.videoKeyOrNull()
-        }
+        val currentVideoStillExists = playerSnapshot.playbackState.videoKeyOrNull()
+            ?.let(currentAndUpcomingKeys::contains) == true
         if (
             !currentVideoStillExists &&
             !preserveRemovedCurrentPresentation &&
@@ -827,8 +906,7 @@ class VideoPlaybackViewModel private constructor(
             preloadController.stop()
             playerController.releaseBinding()
         }
-        currentPage = randomState?.currentIndex
-            ?: currentPage.coerceIn(0, (items.lastIndex).coerceAtLeast(0))
+        currentPage = feedSnapshot.currentIndex
         if (
             queueStructureChanged &&
             currentVideoStillExists &&
@@ -837,18 +915,58 @@ class VideoPlaybackViewModel private constructor(
             prepareNextVideoPlan()
         }
         rebuildUiState()
+        scheduleHydration(feedSnapshot.currentIndex)
+    }
+
+    private fun needsOriginalConfirmation(video: IndexedVideo): Boolean =
+        OriginalPlaybackAdmission.requiresConfirmation(
+            video, qualitySelection.preference, qualitySelection.network,
+        ) && approvedOriginalPlayback != (video.key to video.playbackFileId)
+
+    private fun admitOriginalPlayback(video: IndexedVideo): Boolean {
+        if (!needsOriginalConfirmation(video)) {
+            pendingOriginalPlayback = null
+            return true
+        }
+        pendingOriginalPlayback = video to currentPlanToken()
+        cancelTransparentRecovery(clearAttempt = true)
+        preloadController.stop()
+        playerController.discardStandby()
+        playerController.releaseBinding()
+        rebuildUiState()
+        return false
+    }
+
+    fun confirmOriginalPlayback(key: VideoKey, fileId: Int) {
+        val (video, token) = pendingOriginalPlayback ?: return
+        if (video.key != key || video.playbackFileId != fileId || !isForeground ||
+            targetCoordinator.state.isUnstable || currentItem()?.video?.key != key
+        ) return
+        if (!isPlanRequestCurrent(token, key)) {
+            pendingOriginalPlayback = null
+            rebuildUiState()
+            // Resolve the current representation again after a preference/network change.
+            val pagerPage = targetCoordinator.state.lastSettled?.pagerPage ?: currentPage
+            targetCoordinator.dispatch(PlaybackTargetIntent.Reset)
+            onPageSettled(pagerPage, currentPage)
+            return
+        }
+        approvedOriginalPlayback = key to fileId
+        pendingOriginalPlayback = null
+        bindStableItem(video)
     }
 
     private fun bindStableItem(
         video: com.qixuan.channelvideoflow.model.video.IndexedVideo,
     ) {
-        playbackQueue.recordPlayed(video.key, criteria.value.order)
+        if (!admitOriginalPlayback(video)) return
+        feedSession.recordPlayed(video.key, criteria.value.order)
         val boundKey = playerSnapshot.playbackState.videoKeyOrNull()
         if (boundKey == video.key) {
             playerController.resume()
         } else {
             preloadController.onCurrentPlaybackStarting(video)
-            playerController.bind(video)
+            playerController.bind(video, poolContext())
         }
         if (
             preloadController.ownerHandoff.value.phase !=
@@ -861,12 +979,11 @@ class VideoPlaybackViewModel private constructor(
     }
 
     private fun stopOldFeedRequests() {
+        pendingOriginalPlayback = null
+        approvedOriginalPlayback = null
         playerController.setTemporaryPlaybackSpeed(active = false)
         playbackQueueGeneration += 1L
-        pagerIsUnstable = false
-        pendingPointerDownAtMillis = null
-        unstableTarget = null
-        lastSettledPage = null
+        targetCoordinator.dispatch(PlaybackTargetIntent.Reset)
         stablePageGeneration += 1
         stablePageJob?.cancel()
         stablePageJob = null
@@ -875,6 +992,9 @@ class VideoPlaybackViewModel private constructor(
         retryJob?.cancel()
         retryJob = null
         cancelTransparentRecovery(clearAttempt = true)
+        hydrationRequestGeneration += 1L
+        hydrationJob?.cancel()
+        hydrationJob = null
         preloadController.stop()
         playerController.releaseBinding()
     }
@@ -933,6 +1053,7 @@ class VideoPlaybackViewModel private constructor(
                 video = video,
                 token = token,
                 recordRefresh = false,
+                forStandby = true,
             )
             if (
                 plan != null &&
@@ -959,11 +1080,11 @@ class VideoPlaybackViewModel private constructor(
         target: QueueTarget,
     ) {
         val video = target.video
-        val currentKey = items.getOrNull(currentPage)?.video?.key
+        val currentKey = currentItem()?.video?.key
         val next = nextTarget()
-        val committedTarget = unstableTarget
-            ?.takeIf { pagerIsUnstable }
-            ?.takeIf { it.samePosition(target) }
+        val committedTarget = targetCoordinator.state.unstableTarget
+            ?.takeIf { targetCoordinator.state.isUnstable }
+            ?.takeIf { target.samePosition(it) }
         if (
             plan.terminalFailure != null ||
             playerSnapshot.playbackState.videoKeyOrNull() != currentKey ||
@@ -982,15 +1103,38 @@ class VideoPlaybackViewModel private constructor(
         ) {
             return
         }
-        if (!playerSnapshot.hasRenderedFirstFrame) return
         val preparedVideo = plan.toVideo(video)
-        preloadController.setNextVideo(preparedVideo)
+        if (needsOriginalConfirmation(preparedVideo)) return
+        if (!playerSnapshot.hasRenderedFirstFrame) {
+            // Lightweight stage: register only the single next target so the decoder-free byte
+            // preloader can issue its bounded 256 KiB TTFB prefix. The heavy pool standby is NOT
+            // started here, so the current item keeps the link to finish its own startup reserve.
+            preloadController.setNextVideo(preparedVideo)
+            return
+        }
+        if (playerController.supportsStandbyPreparation) {
+            preloadController.stop()
+            if (!playerController.prepareStandby(preparedVideo, poolContext(plan.token))) {
+                preloadController.setNextVideo(preparedVideo)
+            }
+        } else {
+            preloadController.setNextVideo(preparedVideo)
+        }
     }
+
+    private fun poolContext(token: PlaybackPlanToken = currentPlanToken()) = PlaybackPreparationContext(
+        qualityGeneration = token.qualitySelectionGeneration,
+        accountGeneration = token.accountGeneration,
+        networkGeneration = devicePolicySource.signals.value.networkGeneration,
+        queueGeneration = token.queueGeneration,
+        roundGeneration = token.randomRoundGeneration,
+    )
 
     private suspend fun preparePlaybackPlan(
         video: com.qixuan.channelvideoflow.model.video.IndexedVideo,
         token: PlaybackPlanToken,
         recordRefresh: Boolean,
+        forStandby: Boolean = false,
     ): PlaybackPlan? {
         if (!isPlanRequestCurrent(token, video.key)) return null
         if (recordRefresh) {
@@ -1011,7 +1155,9 @@ class VideoPlaybackViewModel private constructor(
         if (!isPlanRequestCurrent(token, video.key) && refreshResult.terminalFailure == null) {
             return null
         }
-        val selected = selectPlaybackVideo(refreshResult.video ?: video, token.selection)
+        val source = refreshResult.video ?: video
+        val selected = if (forStandby) selectStandbyVideo(source, token.selection)
+            else selectPlaybackVideo(source, token.selection)
         return PlaybackPlan.from(
             video = selected,
             token = token,
@@ -1023,9 +1169,7 @@ class VideoPlaybackViewModel private constructor(
     }
 
     private fun currentPlanToken(
-        randomRoundGeneration: Long? = playbackQueue.randomRoundState
-            ?.current
-            ?.generation
+        randomRoundGeneration: Long? = feedSnapshot.roundGeneration
             ?.takeIf { criteria.value.order == VideoFeedOrder.RANDOM },
     ): PlaybackPlanToken = PlaybackPlanToken(
         qualitySelectionGeneration = qualitySelectionGeneration,
@@ -1041,15 +1185,14 @@ class VideoPlaybackViewModel private constructor(
     ): Boolean {
         if (token != currentPlanToken(token.randomRoundGeneration)) return false
         if (criteria.value.order != VideoFeedOrder.RANDOM) {
-            return items.any { item -> item.video.key == key }
+            return key in feedSnapshot.keys
         }
-        val state = playbackQueue.randomRoundState ?: return false
-        val round = when (token.randomRoundGeneration) {
-            state.current.generation -> state.current
-            state.upcoming?.generation -> state.upcoming
+        val keys = when (token.randomRoundGeneration) {
+            feedSnapshot.roundGeneration -> feedSnapshot.keys
+            feedSnapshot.upcoming?.generation -> feedSnapshot.upcoming?.keys
             else -> null
         }
-        return round?.items?.any { video -> video.key == key } == true
+        return key in keys.orEmpty()
     }
 
     private fun installCurrentPlan(plan: PlaybackPlan) {
@@ -1108,6 +1251,7 @@ class VideoPlaybackViewModel private constructor(
         planPreparation?.deferred?.cancel()
         planPreparation = null
         if (clearNextPlan) {
+            playerController.discardStandby()
             while (true) {
                 val current = playbackPlans.get()
                 if (current.next == null) break
@@ -1139,10 +1283,18 @@ class VideoPlaybackViewModel private constructor(
     }
 
     private fun recordTargetPlanPreparedIfApplicable(target: QueueTarget) {
-        if (pagerIsUnstable && unstableTarget?.samePosition(target) == true) {
+        if (
+            targetCoordinator.state.isUnstable &&
+            targetCoordinator.state.unstableTarget?.let(target::samePosition) == true
+        ) {
             playerController.recordTransition(PlaybackTransitionEvent.PlanPrepared(target.video.key))
         }
     }
+
+    private fun selectStandbyVideo(
+        video: com.qixuan.channelvideoflow.model.video.IndexedVideo,
+        selection: QualitySelection,
+    ) = VideoQualitySelector.selectForStandby(video, selection.preference, selection.network)
 
     private fun selectPlaybackVideo(
         video: com.qixuan.channelvideoflow.model.video.IndexedVideo,
@@ -1152,7 +1304,8 @@ class VideoPlaybackViewModel private constructor(
             video = video,
             preference = selection.preference,
             network = selection.network,
-            availableBandwidthBitsPerSecond = selection.availableBandwidthBitsPerSecond,
+            availableBandwidthBitsPerSecond = networkMetrics.estimate.value
+                ?.availableBitsPerSecond?.takeIf { selection.preference == VideoQualityPreference.AUTO },
         )
 
     private suspend fun refreshVideoForPlayback(
@@ -1216,7 +1369,7 @@ class VideoPlaybackViewModel private constructor(
     private fun interceptFileUnavailableForRecovery(snapshot: VideoPlayerSnapshot): Boolean {
         val failed = snapshot.playbackState as? VideoPlaybackState.Failed ?: return false
         if (failed.reason != VideoPlaybackFailure.FILE_UNAVAILABLE) return false
-        val currentItem = items.getOrNull(currentPage) ?: return false
+        val currentItem = currentItem() ?: return false
         if (currentItem.video.key != failed.video.key) return false
         val token = currentPlanToken()
         val recoveryKey = TransparentRecoveryKey(
@@ -1273,12 +1426,12 @@ class VideoPlaybackViewModel private constructor(
                             TransparentRecoveryOutcome.STALE_REFERENCE,
                         )
                         publishDeferredFileFailure(attempt)
-                    } else {
+                    } else if (admitOriginalPlayback(selected)) {
                         recordTransparentRecoveryFinished(
                             attempt,
                             TransparentRecoveryOutcome.REBOUND,
                         )
-                        playerController.bind(selected)
+                        playerController.bind(selected, poolContext())
                     }
                 }
                 VideoReferenceResolution.MessageMissing,
@@ -1315,14 +1468,14 @@ class VideoPlaybackViewModel private constructor(
     private fun isTransparentRecoveryCurrent(attempt: TransparentRecoveryAttempt): Boolean =
         isTransparentRecoveryPresentationCurrent(attempt) &&
             attempt.key.stablePageGeneration == stablePageGeneration &&
-            items.getOrNull(currentPage)?.video?.key == attempt.key.videoKey &&
+            currentItem()?.video?.key == attempt.key.videoKey &&
             attempt.token == currentPlanToken(attempt.token.randomRoundGeneration)
 
     private fun isTransparentRecoveryPresentationCurrent(
         attempt: TransparentRecoveryAttempt,
     ): Boolean =
         transparentRecoveryAttempt == attempt &&
-            !pagerIsUnstable &&
+            !targetCoordinator.state.isUnstable &&
             attempt.key.qualitySelectionGeneration == qualitySelectionGeneration &&
             attempt.key.accountGeneration == accountGeneration &&
             attempt.token.selection == qualitySelection &&
@@ -1353,48 +1506,162 @@ class VideoPlaybackViewModel private constructor(
     }
 
     private fun nextTarget(): QueueTarget? {
-        if (items.isEmpty()) return null
-        return if (criteria.value.order == VideoFeedOrder.RANDOM) {
-            playbackQueue.randomRoundState?.nextEntry()?.let { QueueTarget(it.video, it) }
+        if (feedSnapshot.keys.isEmpty()) return null
+        val keyTarget = if (criteria.value.order == VideoFeedOrder.RANDOM) {
+            feedSnapshot.nextRandomEntry()?.let { entry ->
+                QueueKeyTarget(entry.key, entry.index, entry)
+            }
         } else {
-            items.getOrNull(currentPage + 1)?.video?.let { QueueTarget(it, null) }
+            feedSnapshot.keys.getOrNull(currentPage + 1)?.let { key ->
+                QueueKeyTarget(key, currentPage + 1, null)
+            }
         }
+        return keyTarget?.let(::hydrateQueueTarget)
     }
 
-    private fun resolveQueueTarget(
+    private fun resolveQueueKeyTarget(
         pagerPage: Int,
         logicalPage: Int,
-    ): QueueTarget? {
+    ): QueueKeyTarget? {
         if (criteria.value.order != VideoFeedOrder.RANDOM) {
-            return items.getOrNull(logicalPage)?.video?.let { QueueTarget(it, null) }
+            return feedSnapshot.keys.getOrNull(logicalPage)?.let { key ->
+                QueueKeyTarget(key, logicalPage, null)
+            }
         }
-        val state = playbackQueue.randomRoundState ?: return null
+        if (feedSnapshot.keys.isEmpty()) return null
         val roundStart = randomRoundStartPagerPage
         val entry = if (roundStart == null) {
-            state.current.items.getOrNull(logicalPage)?.let { state.current.entry(logicalPage) }
+            feedSnapshot.keys.getOrNull(logicalPage)?.let {
+                requireNotNull(feedSnapshot.roundGeneration)
+                PlaybackFeedRoundEntry(it, requireNotNull(feedSnapshot.roundGeneration), logicalPage)
+            }
         } else {
             val offset = pagerPage - roundStart
             when {
-                offset in state.current.items.indices -> state.current.entry(offset)
-                offset >= state.current.items.size -> {
-                    val upcoming = state.upcoming
-                    if (upcoming == null || upcoming.items.isEmpty()) {
-                        state.current.entry(Math.floorMod(offset, state.current.items.size))
+                offset in feedSnapshot.keys.indices -> PlaybackFeedRoundEntry(
+                    feedSnapshot.keys[offset],
+                    requireNotNull(feedSnapshot.roundGeneration),
+                    offset,
+                )
+                offset >= feedSnapshot.keys.size -> {
+                    val upcoming = feedSnapshot.upcoming
+                    if (upcoming == null || upcoming.keys.isEmpty()) {
+                        val index = Math.floorMod(offset, feedSnapshot.keys.size)
+                        PlaybackFeedRoundEntry(
+                            feedSnapshot.keys[index],
+                            requireNotNull(feedSnapshot.roundGeneration),
+                            index,
+                        )
                     } else {
                         val upcomingIndex = Math.floorMod(
-                            offset - state.current.items.size,
-                            upcoming.items.size,
+                            offset - feedSnapshot.keys.size,
+                            upcoming.keys.size,
                         )
                         upcoming.entry(upcomingIndex)
                     }
                 }
-                state.current.items.isNotEmpty() -> {
-                    state.current.entry(Math.floorMod(offset, state.current.items.size))
+                feedSnapshot.keys.isNotEmpty() -> {
+                    val index = Math.floorMod(offset, feedSnapshot.keys.size)
+                    PlaybackFeedRoundEntry(
+                        feedSnapshot.keys[index],
+                        requireNotNull(feedSnapshot.roundGeneration),
+                        index,
+                    )
                 }
                 else -> null
             }
         }
-        return entry?.let { QueueTarget(it.video, it) }
+        return entry?.let { QueueKeyTarget(it.key, it.index, it) }
+    }
+
+    private fun hydrateQueueTarget(target: QueueKeyTarget): QueueTarget? =
+        hydratedVideos[target.key]?.let { video -> QueueTarget(video, target.randomEntry) }
+
+    private fun scheduleHydration(
+        centerIndex: Int,
+        onHydrated: () -> Unit = {},
+    ) {
+        val snapshot = feedSnapshot
+        val centerKey = snapshot.keys.getOrNull(centerIndex) ?: return
+        val entry = snapshot.roundGeneration?.let { generation ->
+            PlaybackFeedRoundEntry(centerKey, generation, centerIndex)
+        }
+        scheduleHydration(QueueKeyTarget(centerKey, centerIndex, entry), onHydrated)
+    }
+
+    private fun scheduleHydration(
+        target: QueueKeyTarget,
+        onHydrated: () -> Unit,
+    ) {
+        val snapshot = feedSnapshot
+        val requestedKeys = hydrationKeysFor(snapshot, target)
+        if (requestedKeys.isEmpty()) return
+        val sessionGeneration = snapshot.generation
+        val requestGeneration = hydrationRequestGeneration + 1L
+        hydrationRequestGeneration = requestGeneration
+        hydrationJob?.cancel()
+        hydrationJob = viewModelScope.launch {
+            val observation = messageRepository.hydrateVideos(requestedKeys)
+            if (
+                requestGeneration != hydrationRequestGeneration ||
+                sessionGeneration != feedSnapshot.generation
+            ) {
+                return@launch
+            }
+            if (observation.failure != null) {
+                feedObservationFailure = observation.failure
+                hydrationJob = null
+                rebuildUiState()
+                return@launch
+            }
+            val requestedKeySet = requestedKeys.toHashSet()
+            observation.value.forEach { video ->
+                if (video.key in requestedKeySet) hydratedVideos[video.key] = video
+            }
+            val retainedKeys = buildSet {
+                addAll(requestedKeys)
+                playerSnapshot.playbackState.videoKeyOrNull()?.let(::add)
+                targetCoordinator.state.lastSettled?.key?.let(::add)
+                playbackPlans.get().current?.key?.let(::add)
+                playbackPlans.get().next?.key?.let(::add)
+                transparentRecoveryAttempt?.key?.videoKey?.let(::add)
+            }
+            hydratedVideos.keys.retainAll(retainedKeys)
+            items = buildItemsFromKeys(
+                retainedKeys.filter(currentFeedKeySet::contains),
+                latestChannelTitles,
+            )
+            reconcilePlaybackPlansWith(items + buildItemsFromKeys(
+                retainedKeys.filter(upcomingFeedKeySet::contains),
+                latestChannelTitles,
+            ))
+            feedObservationFailure = keyObservationFailure
+            hydrationJob = null
+            uiHydrationGeneration += 1L
+            rebuildUiState()
+            if (hydratedVideos[target.key] != null) onHydrated()
+        }
+    }
+
+    private fun hydrationKeysFor(
+        snapshot: PlaybackFeedSnapshot,
+        target: QueueKeyTarget,
+    ): List<VideoKey> {
+        val entry = target.randomEntry
+        val upcoming = snapshot.upcoming
+        if (entry != null && entry.roundGeneration == upcoming?.generation) {
+            val start = (entry.index - FEED_HYDRATION_RADIUS).coerceAtLeast(0)
+            val endExclusive = (entry.index + FEED_HYDRATION_RADIUS + 1)
+                .coerceAtMost(upcoming.keys.size)
+            return buildList {
+                addAll(snapshot.keys.takeLast(FEED_HYDRATION_RADIUS + 1))
+                addAll(upcoming.keys.subList(start, endExclusive))
+            }.distinct()
+        }
+        return snapshot.windowAround(
+            centerIndex = target.logicalIndex,
+            radius = FEED_HYDRATION_RADIUS,
+        ).keys
     }
 
     private fun showUnavailableLink(message: String) {
@@ -1431,7 +1698,7 @@ class VideoPlaybackViewModel private constructor(
         pagerPage: Int,
         target: QueueTarget,
     ): PlaybackTransitionContext {
-        val previousPagerPage = lastSettledPage?.pagerPage
+        val previousPagerPage = targetCoordinator.state.lastSettled?.pagerPage
         val direction = when {
             previousPagerPage == null -> PlaybackTransitionDirection.INITIAL
             pagerPage > previousPagerPage -> PlaybackTransitionDirection.FORWARD
@@ -1442,7 +1709,7 @@ class VideoPlaybackViewModel private constructor(
         val randomRoundBoundary = order == VideoFeedOrder.RANDOM &&
             previousPagerPage != null &&
             target.randomEntry?.roundGeneration !=
-            playbackQueue.randomRoundState?.current?.generation
+            feedSnapshot.roundGeneration
         return PlaybackTransitionContext(
             order = order,
             direction = direction,
@@ -1450,12 +1717,17 @@ class VideoPlaybackViewModel private constructor(
         )
     }
 
-    private fun buildItems(
-        videos: List<com.qixuan.channelvideoflow.model.video.IndexedVideo>,
+    private fun buildItemsFromKeys(
+        keys: Iterable<VideoKey>,
         channelTitles: Map<Long, String>,
-    ): List<FeedVideoItem> = videos.map { video ->
-        buildItem(video, channelTitles)
+    ): List<FeedVideoItem> = keys.mapNotNull { key ->
+        hydratedVideos[key]?.let { video -> buildItem(video, channelTitles) }
     }
+
+    private fun currentItem(): FeedVideoItem? = feedSnapshot.keys
+        .getOrNull(currentPage)
+        ?.let(hydratedVideos::get)
+        ?.let(::buildItem)
 
     private fun buildItem(
         video: com.qixuan.channelvideoflow.model.video.IndexedVideo,
@@ -1471,25 +1743,32 @@ class VideoPlaybackViewModel private constructor(
         mutableUiState.value = VideoPlaybackUiState(
             phase = when {
                 !sourceLoaded -> VideoFeedPhase.LOADING
-                items.isEmpty() -> VideoFeedPhase.EMPTY
+                feedObservationFailure != null && feedSnapshot.keys.isEmpty() -> VideoFeedPhase.ERROR
+                feedSnapshot.keys.isEmpty() -> VideoFeedPhase.EMPTY
                 else -> VideoFeedPhase.CONTENT
             },
+            feedKeys = feedSnapshot.keys,
             items = items,
+            upcomingKeys = feedSnapshot.upcoming?.keys.orEmpty(),
             upcomingItems = if (criteria.value.order == VideoFeedOrder.RANDOM) {
-                buildItems(
-                    playbackQueue.randomRoundState?.upcoming?.items.orEmpty(),
+                buildItemsFromKeys(
+                    hydratedVideos.keys.filter(upcomingFeedKeySet::contains),
                     latestChannelTitles,
                 )
             } else {
                 emptyList()
             },
+            feedGeneration = feedSnapshot.generation,
+            hydrationGeneration = uiHydrationGeneration,
             order = criteria.value.order,
             queueGeneration = queueGeneration,
             randomRoundStartPagerPage = randomRoundStartPagerPage,
             currentPage = currentPage,
             player = playerSnapshot.toPresentationSnapshot(),
+            originalPlaybackAwaitingConfirmation = pendingOriginalPlayback?.first,
             showSwipeHint = swipeHintVisible,
             originalMessageLink = originalMessageLink,
+            feedFailure = feedObservationFailure,
         )
     }
 
@@ -1504,7 +1783,7 @@ class VideoPlaybackViewModel private constructor(
             return
         }
         val ready = playerSnapshot.playbackState as? VideoPlaybackState.Ready ?: return
-        val currentVideo = items.getOrNull(currentPage)?.video ?: return
+        val currentVideo = currentItem()?.video ?: return
         if (
             !currentVideo.supportsStreaming ||
             ready.video.key != currentVideo.key ||
@@ -1590,11 +1869,13 @@ class VideoPlaybackViewModel private constructor(
         val filter: VideoFilter,
         val order: VideoFeedOrder,
         val channelTitles: Map<Long, String>,
+        val retryToken: Long,
     )
 
     private data class FeedSourceResult(
         val source: FeedSource,
-        val videos: List<com.qixuan.channelvideoflow.model.video.IndexedVideo>,
+        val rows: List<VideoFeedKeySnapshot>,
+        val failure: RepositoryObservationFailure?,
     )
 
     private data class PlaybackRefreshResult(
@@ -1606,7 +1887,7 @@ class VideoPlaybackViewModel private constructor(
     private data class QualitySelection(
         val preference: VideoQualityPreference,
         val network: NetworkTransport,
-        val availableBandwidthBitsPerSecond: Long?,
+        val networkGeneration: Long,
     )
 
     private data class PlaybackPlanToken(
@@ -1637,6 +1918,7 @@ class VideoPlaybackViewModel private constructor(
         val playbackFileId: Int,
         val supportsStreaming: Boolean,
         val selectedAlternative: VideoPlaybackVariant?,
+        val availableVariants: List<VideoPlaybackVariant>,
         val selectionResult: PlaybackSelectionResult,
         val token: PlaybackPlanToken,
         val refreshOutcome: PlaybackPlanRefreshOutcome,
@@ -1703,6 +1985,7 @@ class VideoPlaybackViewModel private constructor(
                 playbackFileId = video.playbackFileId,
                 supportsStreaming = video.supportsStreaming,
                 selectedAlternative = video.selectedAlternative,
+                availableVariants = video.alternativeVariants,
                 selectionResult = if (video.selectedAlternative == null) {
                     PlaybackSelectionResult.ORIGINAL
                 } else {
@@ -1745,21 +2028,34 @@ class VideoPlaybackViewModel private constructor(
         val attempted: Boolean = true,
     )
 
-    private data class SettledPage(
-        val pagerPage: Int,
-        val key: VideoKey,
-        val queueGeneration: Long,
-    )
-
     private data class QueueTarget(
         val video: com.qixuan.channelvideoflow.model.video.IndexedVideo,
-        val randomEntry: RandomRoundEntry?,
+        val randomEntry: PlaybackFeedRoundEntry?,
     ) {
         fun samePosition(other: QueueTarget): Boolean =
             video.key == other.video.key &&
                 randomEntry?.roundGeneration == other.randomEntry?.roundGeneration &&
                 randomEntry?.index == other.randomEntry?.index
+
+        fun samePosition(other: PlaybackTargetIdentity): Boolean =
+            video.key == other.key &&
+                randomEntry?.roundGeneration == other.randomRoundGeneration &&
+                randomEntry?.index == other.randomRoundIndex
+
+        fun toIdentity(pagerPage: Int, logicalPage: Int) = PlaybackTargetIdentity(
+            pagerPage = pagerPage,
+            logicalPage = logicalPage,
+            key = video.key,
+            randomRoundGeneration = randomEntry?.roundGeneration,
+            randomRoundIndex = randomEntry?.index,
+        )
     }
+
+    private data class QueueKeyTarget(
+        val key: VideoKey,
+        val logicalIndex: Int,
+        val randomEntry: PlaybackFeedRoundEntry?,
+    )
 
     private data class PlaybackTransitionContext(
         val order: VideoFeedOrder,
@@ -1770,6 +2066,7 @@ class VideoPlaybackViewModel private constructor(
     private companion object {
         const val QUALITY_REFRESH_TIMEOUT_MILLIS = 3_000L
         const val SWIPE_HINT_DURATION_MILLIS = 2_000L
+        const val FEED_HYDRATION_RADIUS = 3
 
         fun monotonicTimeMillis(): Long = System.nanoTime() / 1_000_000L
     }

@@ -100,7 +100,7 @@ class LoginScreenTest {
         render(state)
 
         composeRule.onNodeWithText("手机号").assertIsDisplayed()
-        composeRule.onNodeWithTag("login-input").assertIsDisplayed()
+        composeRule.onNodeWithTag("login-input").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("login-submit").assertIsDisplayed()
         assertNoText("验证码")
         assertNoText("两步验证密码")
@@ -122,11 +122,11 @@ class LoginScreenTest {
         )
         render(state)
 
-        composeRule.onNodeWithText("验证码").assertIsDisplayed()
-        composeRule.onNodeWithText("验证码已发送至：另一台已登录设备的 Telegram 服务消息").assertIsDisplayed()
-        composeRule.onNodeWithText("60 秒后可改用：短信").assertIsDisplayed()
+        composeRule.onNodeWithText("验证码").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("验证码已发送至：另一台已登录设备的 Telegram 服务消息").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText("60 秒后可改用：短信").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("login-resend-code").assertIsNotEnabled()
-        composeRule.onNodeWithTag("login-input").assertIsDisplayed()
+        composeRule.onNodeWithTag("login-input").performScrollTo().assertIsDisplayed()
         assertNoText("手机号")
         assertNoText("两步验证密码")
     }
@@ -155,7 +155,7 @@ class LoginScreenTest {
             state.value = nextState
 
             composeRule.onNodeWithText(status).assertIsDisplayed()
-            composeRule.onNodeWithTag("login-progress").assertIsDisplayed()
+            composeRule.onNodeWithTag("login-progress").performScrollTo().assertIsDisplayed()
             assertNoTag("login-input")
             assertNoTag("login-password-input")
         }
@@ -166,7 +166,7 @@ class LoginScreenTest {
         val state = mutableStateOf(LoginUiState(LoginStep.CODE, input = "synthetic-code", isSubmitting = true))
         render(state)
 
-        composeRule.onNodeWithTag("login-progress").assertIsDisplayed()
+        composeRule.onNodeWithTag("login-progress").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("login-submit").assertIsNotEnabled()
     }
 
@@ -194,7 +194,7 @@ class LoginScreenTest {
         render(state)
 
         composeRule.onNodeWithText("配置你自己的 Telegram API").assertIsDisplayed()
-        composeRule.onNodeWithTag("login-credential-api-id").assertIsDisplayed()
+        composeRule.onNodeWithTag("login-credential-api-id").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("login-credential-api-hash").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithText(
             "API ID 应为正整数；API Hash 应为 32 位十六进制字符。",
@@ -280,7 +280,7 @@ class LoginScreenTest {
         )
         render(state)
 
-        composeRule.onNodeWithTag("login-progress").assertIsDisplayed()
+        composeRule.onNodeWithTag("login-progress").performScrollTo().assertIsDisplayed()
         composeRule.onNodeWithTag("login-retry").assertIsNotEnabled()
     }
 

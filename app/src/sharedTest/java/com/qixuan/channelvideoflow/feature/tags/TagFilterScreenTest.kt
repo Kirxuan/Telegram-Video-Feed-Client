@@ -20,6 +20,7 @@ import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -35,6 +36,7 @@ import com.qixuan.channelvideoflow.model.video.TagFilterMode
 import com.qixuan.channelvideoflow.model.video.TagSummary
 import com.qixuan.channelvideoflow.ui.theme.ChannelVideoFlowTheme
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -71,7 +73,11 @@ class TagFilterScreenTest {
         composeRule.onNodeWithTag(TagFilterTestTags.List)
             .performScrollToNode(androidx.compose.ui.test.hasTestTag(TagFilterTestTags.tag("news")))
         composeRule.onNodeWithTag(TagFilterTestTags.tag("news")).performClick()
+        composeRule.onNodeWithTag(TagFilterTestTags.List)
+            .performScrollToNode(androidx.compose.ui.test.hasText("全部标签"))
         composeRule.onNodeWithText("全部标签").performClick()
+        composeRule.onNodeWithTag(TagFilterTestTags.List)
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag(TagFilterTestTags.ClearSelection))
         composeRule.onNodeWithTag(TagFilterTestTags.ClearSelection).performClick()
         composeRule.onNodeWithTag(TagFilterTestTags.Continue).assertIsEnabled().performClick()
         composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
@@ -123,7 +129,11 @@ class TagFilterScreenTest {
         composeRule.onNodeWithTag(TagFilterTestTags.NoResults).assertIsDisplayed()
         composeRule.onNodeWithText("没有匹配的标签").assertIsDisplayed()
         composeRule.onNodeWithTag(TagFilterTestTags.Continue).assertIsEnabled()
+        composeRule.onNodeWithTag(TagFilterTestTags.List)
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag(TagFilterTestTags.ClearSearch))
         composeRule.onNodeWithTag(TagFilterTestTags.ClearSearch).performClick()
+        composeRule.onNodeWithTag(TagFilterTestTags.List)
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag(TagFilterTestTags.tag("新闻")))
         composeRule.onNodeWithText("#新闻").assertIsDisplayed()
         composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
             androidx.compose.ui.test.hasTestTag(TagFilterTestTags.tag("kotlin")),
@@ -154,7 +164,11 @@ class TagFilterScreenTest {
             )
         }
 
+        composeRule.onNodeWithTag(TagFilterTestTags.List)
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag(TagFilterTestTags.ClearSearch))
         composeRule.onNodeWithTag(TagFilterTestTags.ClearSearch).performClick()
+        composeRule.onNodeWithTag(TagFilterTestTags.List)
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag(TagFilterTestTags.ClearSelection))
         composeRule.onNodeWithTag(TagFilterTestTags.ClearSelection).performClick()
         assertEquals(listOf("search", "selection"), events)
     }
@@ -173,16 +187,25 @@ class TagFilterScreenTest {
             )
         }
 
+        composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
+            androidx.compose.ui.test.hasTestTag(TagFilterTestTags.Loading),
+        )
         composeRule.onNodeWithTag(TagFilterTestTags.Loading).assertIsDisplayed()
         composeRule.onNodeWithTag(TagFilterTestTags.Continue).assertIsNotEnabled()
 
         state = TagFilterUiState(isLoading = false)
+        composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
+            androidx.compose.ui.test.hasText("尚未选择频道"),
+        )
         composeRule.onNodeWithText("尚未选择频道").assertIsDisplayed()
         composeRule.onNodeWithText("请返回频道页，至少选择一个频道后再筛选。")
             .performScrollTo()
             .assertIsDisplayed()
 
         state = TagFilterUiState(isLoading = false, channelIds = setOf(10L))
+        composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
+            androidx.compose.ui.test.hasText("暂无标签"),
+        )
         composeRule.onNodeWithText("暂无标签").assertIsDisplayed()
         composeRule.onNodeWithText("浏览全部视频").assertIsDisplayed()
         composeRule.onNodeWithTag(TagFilterTestTags.Continue).assertIsEnabled()
@@ -193,6 +216,9 @@ class TagFilterScreenTest {
             totalTagCount = 2,
             selectedNames = setOf("hidden"),
             searchQuery = "missing",
+        )
+        composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
+            androidx.compose.ui.test.hasText("没有匹配的标签"),
         )
         composeRule.onNodeWithText("没有匹配的标签").assertIsDisplayed()
         composeRule.onNodeWithText("应用筛选并浏览").assertIsDisplayed()
@@ -223,6 +249,8 @@ class TagFilterScreenTest {
         composeRule.onNodeWithContentDescription("返回频道选择")
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
         composeRule.onNodeWithText("任一标签").assertIsSelected()
+        composeRule.onNodeWithTag(TagFilterTestTags.List)
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag(TagFilterTestTags.tag("news")))
         composeRule.onNodeWithTag(TagFilterTestTags.tag("news"))
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Checkbox))
             .assertIsOn()
@@ -234,10 +262,11 @@ class TagFilterScreenTest {
 
     @Test
     fun narrowDarkLargeFontKeepsSearchModesAndBottomActionReadable() {
+        val longLabel = "#" + "很长的中英文标签MixedContent需要继续展开才能完整阅读".repeat(8)
         composeRule.setContent {
             val systemDensity = LocalDensity.current
             CompositionLocalProvider(
-                LocalDensity provides Density(systemDensity.density, 1.35f),
+                LocalDensity provides Density(systemDensity.density, 2f),
             ) {
                 ChannelVideoFlowTheme(darkTheme = true) {
                     Box(modifier = Modifier.width(320.dp).fillMaxHeight()) {
@@ -247,7 +276,7 @@ class TagFilterScreenTest {
                                 channelIds = setOf(10L),
                                 tags = listOf(
                                     TagFilterItem(
-                                        TagSummary("long", "#很长的中英文标签MixedContent", 3),
+                                        TagSummary("long", longLabel, 3),
                                         true,
                                     ),
                                 ),
@@ -266,8 +295,25 @@ class TagFilterScreenTest {
         }
 
         composeRule.onNodeWithTag(TagFilterTestTags.Search).assertIsDisplayed()
+        composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
+            androidx.compose.ui.test.hasTestTag(TagFilterTestTags.Mode),
+        )
         composeRule.onNodeWithText("任一标签").assertIsDisplayed()
         composeRule.onNodeWithText("全部标签").assertIsDisplayed()
         composeRule.onNodeWithTag(TagFilterTestTags.Continue).assertIsDisplayed()
+        composeRule.onNodeWithTag(TagFilterTestTags.List).performScrollToNode(
+            androidx.compose.ui.test.hasTestTag(TagFilterTestTags.tag("long")),
+        )
+        composeRule.waitUntil(1_000L) {
+            composeRule.onAllNodesWithTag(TagFilterTestTags.expand("long"))
+                .fetchSemanticsNodes().isNotEmpty()
+        }
+        val labelBounds = composeRule.onNodeWithText(longLabel, useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val countBounds = composeRule.onNodeWithText("3 个视频", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        assertTrue("video count should stay in the trailing column", countBounds.left > labelBounds.left)
+        composeRule.onNodeWithTag(TagFilterTestTags.expand("long")).performScrollTo().performClick()
+        composeRule.onNodeWithText("收起标签").fetchSemanticsNode()
     }
 }

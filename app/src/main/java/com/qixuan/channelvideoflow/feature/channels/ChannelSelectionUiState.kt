@@ -24,6 +24,7 @@ data class ChannelSelectionItem(
 )
 
 data class ChannelScanSummary(
+    val duplicateVideoEncounterCount: Long = 0,
     val processedVideoCandidateCount: Long = 0,
     val videoSearchPageCount: Int = 0,
     val indexedVideoCount: Int = 0,

@@ -8,6 +8,9 @@ import com.qixuan.channelvideoflow.telegram.config.TelegramCredentialsProvider
 import com.qixuan.channelvideoflow.telegram.config.TelegramCredentialsResult
 import com.qixuan.channelvideoflow.telegram.logging.AuthEventLogger
 import com.qixuan.channelvideoflow.telegram.storage.TdLibDirectories
+import com.qixuan.channelvideoflow.telegram.storage.SecureTdLibDatabaseKeyProvider
+import com.qixuan.channelvideoflow.telegram.storage.TdLibDatabaseKeyProvider
+import com.qixuan.channelvideoflow.telegram.storage.TdLibDatabaseKeyResult
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -19,6 +22,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
@@ -34,6 +38,7 @@ internal class TelegramClientManager private constructor(
     private val logger: AuthEventLogger,
     private val applicationInfo: TdLibApplicationInfo,
     private val dispatcher: CoroutineDispatcher,
+    private val databaseKeyProvider: TdLibDatabaseKeyProvider,
     @Suppress("UNUSED_PARAMETER") constructorMarker: Unit,
 ) : TelegramAuthClient, TelegramChatClient, TelegramMessageClient, TelegramFileClient {
     constructor(
@@ -50,6 +55,7 @@ internal class TelegramClientManager private constructor(
         dispatcher = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "cvf-tdlib-events")
         }.asCoroutineDispatcher(),
+        databaseKeyProvider = SecureTdLibDatabaseKeyProvider(context),
         constructorMarker = Unit,
     )
 
@@ -60,7 +66,19 @@ internal class TelegramClientManager private constructor(
         logger: AuthEventLogger,
         applicationInfo: TdLibApplicationInfo,
         dispatcher: CoroutineDispatcher,
-    ) : this(credentialsProvider, directories, bridge, logger, applicationInfo, dispatcher, Unit)
+        databaseKeyProvider: TdLibDatabaseKeyProvider = TdLibDatabaseKeyProvider {
+            TdLibDatabaseKeyResult.LegacyUnencrypted
+        },
+    ) : this(
+        credentialsProvider,
+        directories,
+        bridge,
+        logger,
+        applicationInfo,
+        dispatcher,
+        databaseKeyProvider,
+        Unit,
+    )
 
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val mutableEvents = MutableSharedFlow<TelegramClientEvent>(extraBufferCapacity = 16)
@@ -72,10 +90,14 @@ internal class TelegramClientManager private constructor(
         MutableSharedFlow<TelegramMessageClientEvent>(extraBufferCapacity = 256)
     override val messageEvents: SharedFlow<TelegramMessageClientEvent> =
         mutableMessageEvents.asSharedFlow()
-    private val mutableFileEvents =
-        MutableSharedFlow<TelegramFileClientEvent>(extraBufferCapacity = 256)
-    override val fileEvents: SharedFlow<TelegramFileClientEvent> =
-        mutableFileEvents.asSharedFlow()
+    private val mutableFileControlEvents =
+        MutableSharedFlow<TelegramFileClientEvent>(extraBufferCapacity = 16)
+    private val mutableFileUpdateEvents =
+        MutableSharedFlow<TelegramFileClientEvent>(extraBufferCapacity = 64)
+    override val fileEvents = merge(mutableFileControlEvents, mutableFileUpdateEvents)
+    private val fileUpdateConflator = FileUpdateConflator(scope) { snapshot ->
+        mutableFileUpdateEvents.emit(TelegramFileClientEvent.FileUpdated(snapshot))
+    }
 
     private var session: TdLibSession? = null
     private var sessionToken: SessionToken? = null
@@ -395,9 +417,7 @@ internal class TelegramClientManager private constructor(
                     fromCache = update.fromCache,
                 ),
             )
-            is TdApi.UpdateFile -> mutableFileEvents.emit(
-                TelegramFileClientEvent.FileUpdated(TdLibFileObjectMapper.map(update.file)),
-            )
+            is TdApi.UpdateFile -> fileUpdateConflator.offer(TdLibFileObjectMapper.map(update.file))
         }
     }
 
@@ -425,10 +445,13 @@ internal class TelegramClientManager private constructor(
             is TdApi.AuthorizationStateLoggingOut -> {
                 mutableChatEvents.emit(TelegramChatClientEvent.AccountLoggingOut)
                 mutableMessageEvents.emit(TelegramMessageClientEvent.AccountLoggingOut)
-                mutableFileEvents.emit(TelegramFileClientEvent.AccountLoggingOut)
+                fileUpdateConflator.advanceGeneration()
+                mutableFileControlEvents.emit(TelegramFileClientEvent.AccountLoggingOut)
             }
-            is TdApi.AuthorizationStateReady ->
-                mutableFileEvents.emit(TelegramFileClientEvent.Ready)
+            is TdApi.AuthorizationStateReady -> {
+                fileUpdateConflator.advanceGeneration()
+                mutableFileControlEvents.emit(TelegramFileClientEvent.Ready)
+            }
         }
     }
 
@@ -509,11 +532,24 @@ internal class TelegramClientManager private constructor(
             emitFatal(FatalCategory.DATABASE)
             return
         }
+        val tdLibDatabaseEncryptionKey = when (
+            val keyResult = databaseKeyProvider.loadOrCreate(directories.databaseDirectory)
+        ) {
+            TdLibDatabaseKeyResult.LegacyUnencrypted -> byteArrayOf()
+            is TdLibDatabaseKeyResult.Available -> keyResult.key
+            TdLibDatabaseKeyResult.MigrationRequired,
+            TdLibDatabaseKeyResult.Unavailable,
+            -> {
+                lastParameterState = state
+                closeAfterDatabaseFailure(token)
+                return
+            }
+        }
         val parameters = TdApi.SetTdlibParameters().apply {
             useTestDc = false
             databaseDirectory = directories.databaseDirectory.absolutePath
             filesDirectory = directories.filesDirectory.absolutePath
-            databaseEncryptionKey = byteArrayOf()
+            databaseEncryptionKey = tdLibDatabaseEncryptionKey
             useFileDatabase = true
             useChatInfoDatabase = true
             useMessageDatabase = true
@@ -537,6 +573,23 @@ internal class TelegramClientManager private constructor(
         }
     }
 
+    private suspend fun closeAfterDatabaseFailure(token: SessionToken) {
+        emitFatal(FatalCategory.DATABASE)
+        val active = session ?: return
+        try {
+            active.send(TdApi.Close()) { result ->
+                if (result is TdApi.Error) {
+                    scope.launch {
+                        if (isCurrent(token)) logger.failure("DATABASE_CLOSE_FAILED", result.code)
+                    }
+                }
+            }
+        } catch (throwable: Throwable) {
+            rethrowCancellation(throwable)
+            logger.failure("DATABASE_CLOSE_FAILED", 0)
+        }
+    }
+
     private suspend fun handleResult(
         token: SessionToken,
         request: TelegramAuthRequest,
@@ -545,6 +598,10 @@ internal class TelegramClientManager private constructor(
         if (!isCurrent(token)) return
         if (result !is TdApi.Error) return
         logger.failure("REQUEST_FAILED", result.code)
+        if (request == TelegramAuthRequest.PARAMETERS && result.code == INVALID_DATABASE_KEY_CODE) {
+            closeAfterDatabaseFailure(token)
+            return
+        }
         if (request == TelegramAuthRequest.CLOSE) {
             restartAfterClose = false
             emitFatal(FatalCategory.INITIALIZATION)
@@ -598,6 +655,7 @@ internal class TelegramClientManager private constructor(
     }
 
     private companion object {
+        const val INVALID_DATABASE_KEY_CODE = 401
         val FLOOD_WAIT_PATTERN = Regex("FLOOD_WAIT_?(\\d+)", RegexOption.IGNORE_CASE)
     }
 }

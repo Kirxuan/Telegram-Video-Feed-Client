@@ -26,6 +26,9 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.ChannelVideoFlow"
         android:usesCleartextTraffic="false">
+        <profileable
+            android:shell="true"
+            tools:targetApi="29" />
         <activity
             android:name=".MainActivity"
             android:configChanges="keyboardHidden|orientation|screenSize|smallestScreenSize"

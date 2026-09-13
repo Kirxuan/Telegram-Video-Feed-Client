@@ -275,9 +275,9 @@ internal fun NextPreloadBudgetDecision.permitsSamplePreload(): Boolean =
 
 @OptIn(markerClass = [UnstableApi::class])
 internal class ReservoirAwarePreloadLoadControl(
-    private val delegate: LoadControl,
+    delegate: LoadControl,
     private val preloadAllowed: () -> Boolean,
-) : LoadControl by delegate {
+) : ForwardingLoadControl(delegate) {
     override fun shouldContinuePreloading(
         playerId: PlayerId,
         timeline: androidx.media3.common.Timeline,
@@ -286,12 +286,17 @@ internal class ReservoirAwarePreloadLoadControl(
     ): Boolean = preloadAllowed()
 }
 
+@OptIn(markerClass = [UnstableApi::class])
 internal class CappedNextSampleGateway(
     private val delegate: TelegramFileGateway,
     private val payloadFileIds: Set<Int>,
     private val allowedPayloadEnd: Long,
     private val requestSession: PlaybackRangeRequestSession,
+    private val requestBudget: SampleRequestBudget = SampleRequestBudget(),
+    /** Pool parsing may need an MP4 tail index; every requested resource shares the same cap. */
+    private val allowSparsePayloadRanges: Boolean = false,
 ) : TelegramFileGateway by delegate {
+
     override fun acquireRange(
         fileId: Int,
         offset: Long,
@@ -301,13 +306,24 @@ internal class CappedNextSampleGateway(
         ownerKind: TelegramFileOwnerKind,
         readAheadBytes: Long,
     ): TelegramFileRangeLease {
-        if (requestSession.isPreloadOnly() && fileId in payloadFileIds) {
+        val preloadOnly = requestSession.isPreloadOnly()
+        val readAheadCeiling = if (preloadOnly) NextPreloadBudgetControllerBridge.CHUNK_BYTES
+            else TelegramMediaDataSource.MAX_CURRENT_READ_AHEAD_BYTES
+        require(readAheadBytes >= length && readAheadBytes <= readAheadCeiling)
+        val effectiveReadAhead = if (preloadOnly) length else readAheadBytes
+        if (preloadOnly && (allowSparsePayloadRanges || fileId in payloadFileIds)) {
             require(offset >= 0L && length > 0L && offset <= Long.MAX_VALUE - length)
-            require(offset + length <= allowedPayloadEnd) {
+            require(allowSparsePayloadRanges || offset + length <= allowedPayloadEnd) {
                 "sample preload requested bytes outside the Stage 18D budget"
             }
+            val snapshot = delegate.currentSnapshot(fileId)
+            val cachedStart = if (snapshot?.isDownloadingCompleted == true) 0L else snapshot?.downloadOffset ?: 0L
+            val cachedEnd = if (snapshot?.isDownloadingCompleted == true) snapshot.size else
+                cachedStart + (snapshot?.downloadedPrefixSize ?: 0L)
+            val covered = if (snapshot?.localPath == null) 0L else
+                (minOf(offset + length, cachedEnd) - maxOf(offset, cachedStart)).coerceIn(0L, length)
+            requestBudget.reserve(length - covered, allowedPayloadEnd)
         }
-        require(readAheadBytes <= NextPreloadBudgetControllerBridge.CHUNK_BYTES)
         return delegate.acquireRange(
             fileId,
             offset,
@@ -315,8 +331,36 @@ internal class CappedNextSampleGateway(
             priority,
             ownerToken,
             ownerKind,
-            readAheadBytes,
+            // TDLib schedules readAheadBytes, so speculative reads must not exceed the
+            // range reserved above. Current playback regains its normal read-ahead.
+            effectiveReadAhead,
         )
+    }
+}
+
+/** Shared by every attempt for one target; cancellations never refund requested bytes. */
+internal class SampleRequestBudget {
+    @Volatile
+    var reservedBytes: Long = 0L
+        private set
+
+    /**
+     * Hands over the bytes another stage already charged to the same target, so this budget cannot
+     * spend its full ceiling on top of them. Cancelled requests are part of that handed-over
+     * amount: the target's lifetime accounting does not refund.
+     */
+    @Synchronized
+    fun seed(alreadyRequestedBytes: Long) {
+        reservedBytes = alreadyRequestedBytes.coerceAtLeast(0L)
+    }
+
+    @Synchronized
+    fun reserve(uncachedBytes: Long, limit: Long) {
+        require(uncachedBytes >= 0L && limit >= 0L)
+        require(uncachedBytes <= (limit - reservedBytes).coerceAtLeast(0L)) {
+            "sample preload exhausted its target lifetime request budget"
+        }
+        reservedBytes += uncachedBytes
     }
 }
 
@@ -341,8 +385,11 @@ internal data class SamplePreloadAbResult(
     val candidateP95Millis: Long,
     val improvementFraction: Double,
     val firstFrameComplete: Boolean,
+    val sampleCountComplete: Boolean,
+    val wastedBytesWithinLimit: Boolean,
     val safetyFailures: Int,
-    val enableByDefault: Boolean,
+    // Thirty samples are screening only; this result cannot authorize production enablement.
+    val screeningPassed: Boolean,
 )
 
 internal object SamplePreloadAbEvaluator {
@@ -352,18 +399,34 @@ internal object SamplePreloadAbEvaluator {
         firstFrameCount: Int,
         transitionCount: Int,
         safetyFailures: Int,
+        baselineSkippedNextWastedBytes: List<Long> = emptyList(),
+        candidateSkippedNextWastedBytes: List<Long> = emptyList(),
     ): SamplePreloadAbResult {
         val baseline = p95(baselineMillis)
         val candidate = p95(candidateMillis)
         val improvement = if (baseline > 0L) (baseline - candidate).toDouble() / baseline else 0.0
         val complete = transitionCount > 0 && firstFrameCount == transitionCount
+        val sampleCountComplete = baselineMillis.size >= MINIMUM_SAMPLE_COUNT &&
+            candidateMillis.size >= MINIMUM_SAMPLE_COUNT &&
+            transitionCount >= MINIMUM_SAMPLE_COUNT
+        val baselineWaste = p95OrZero(baselineSkippedNextWastedBytes)
+        val candidateWaste = p95OrZero(candidateSkippedNextWastedBytes)
+        val wasteLimit = if (baselineWaste == 0L) 0L else (baselineWaste * 1.25).toLong()
+        val wastedBytesWithinLimit = candidateWaste <= wasteLimit
         return SamplePreloadAbResult(
             baseline,
             candidate,
             improvement,
             complete,
+            sampleCountComplete,
+            wastedBytesWithinLimit,
             safetyFailures,
-            improvement >= 0.15 && complete && safetyFailures == 0,
+            improvement >= MINIMUM_P95_IMPROVEMENT &&
+                baseline - candidate >= MINIMUM_ABSOLUTE_IMPROVEMENT_MILLIS &&
+                complete &&
+                sampleCountComplete &&
+                wastedBytesWithinLimit &&
+                safetyFailures == 0,
         )
     }
 
@@ -372,4 +435,10 @@ internal object SamplePreloadAbEvaluator {
         val sorted = values.sorted()
         return sorted[(kotlin.math.ceil(sorted.size * 0.95).toInt() - 1).coerceIn(0, sorted.lastIndex)]
     }
+
+    private fun p95OrZero(values: List<Long>): Long = if (values.isEmpty()) 0L else p95(values)
+
+    private const val MINIMUM_ABSOLUTE_IMPROVEMENT_MILLIS = 75L
+    private const val MINIMUM_SAMPLE_COUNT = 30
+    private const val MINIMUM_P95_IMPROVEMENT = 0.15
 }

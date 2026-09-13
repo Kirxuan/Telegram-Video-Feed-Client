@@ -12,6 +12,34 @@ import com.qixuan.channelvideoflow.model.video.VideoQualityPreference
  * original Telegram file remains selected.
  */
 object VideoQualitySelector {
+    /**
+     * Standby quality ceiling, expressed as the Telegram short edge so portrait and landscape
+     * encodes are both covered. Five seconds of an original can cost ~10 MiB while five seconds of
+     * 480p costs ~0.6 MiB, so the cheaper representation buys far more prepared wall-clock time
+     * inside the same byte budget and is the main lever on promotion hit rate.
+     */
+    const val STANDBY_MAX_SHORT_EDGE = 480
+
+    /** Freeze the next AUTO representation so bandwidth updates cannot undo prepared samples. */
+    fun selectForStandby(
+        video: IndexedVideo,
+        preference: VideoQualityPreference,
+        network: NetworkTransport,
+    ): IndexedVideo {
+        if (preference != VideoQualityPreference.AUTO || !video.supportsStreaming) {
+            return select(video, preference, network)
+        }
+        val alternatives = video.alternativeVariants.filter {
+            it.isEligible() && it.fileId != video.fileId && it.isLowerCostThan(video)
+        }
+        // Short edge supports both portrait and landscape Telegram encodes.
+        val low = alternatives.filter { minOf(it.width, it.height) <= STANDBY_MAX_SHORT_EDGE }
+        val bestResolution = low.maxOfOrNull { minOf(it.width, it.height) }
+        val selected = low.filter { minOf(it.width, it.height) == bestResolution }.minByKnownSize()
+            ?: selectDataSaver(video, alternatives)
+        return video.copy(selectedAlternative = selected)
+    }
+
     fun select(
         video: IndexedVideo,
         preference: VideoQualityPreference,
@@ -27,10 +55,13 @@ object VideoQualitySelector {
             .filter { variant -> variant.isEligible() }
             .filterNot { variant -> variant.fileId == video.fileId }
             .distinctBy(VideoPlaybackVariant::fileId)
+            .filter { variant -> variant.isLowerCostThan(video) }
             .toList()
         if (alternatives.isEmpty()) return video.copy(selectedAlternative = null)
 
-        if (preference == VideoQualityPreference.AUTO && availableBandwidthBitsPerSecond != null) {
+        if (preference == VideoQualityPreference.AUTO && network == NetworkTransport.WIFI &&
+            availableBandwidthBitsPerSecond != null
+        ) {
             return video.copy(
                 selectedAlternative = selectSustainable(
                     video = video,

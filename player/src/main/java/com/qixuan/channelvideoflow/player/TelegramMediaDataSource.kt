@@ -39,6 +39,13 @@ class TelegramMediaDataSource(
     private val onCurrentRangeLeaseAcquired: ((Boolean) -> Unit)? = null,
     private val ownerKindOverride: TelegramFileOwnerKind? = null,
     private val maxReadAheadBytes: Long = MAX_CURRENT_READ_AHEAD_BYTES,
+    /**
+     * Live ceiling for the read-ahead window of the current stream. TDLib keeps serving a range
+     * that was already acquired, so a bounded next item cannot get the link until the current
+     * stream's in-flight window drains. Narrowing that window while the next item waits hands the
+     * link over within roughly one window instead of one full 4 MiB window.
+     */
+    private val dynamicMaxReadAheadBytes: (() -> Long)? = null,
 ) : DataSource {
     private val closeLock = Any()
     private var currentUri: Uri? = null
@@ -70,7 +77,9 @@ class TelegramMediaDataSource(
         if (remaining == 0L) return 0L
         if (isAtKnownEndOfFile()) return 0L
 
-        val initialLength = requestedLength(remaining)
+        // Let the extractor inspect the header/index as soon as one small range is
+        // available. The independent rolling read-ahead still keeps TDLib downloading.
+        val initialLength = requestedLength(remaining).coerceAtMost(INITIAL_REQUIRED_BYTES)
         val currentFileId = fileId ?: throw TelegramMediaDataSourceException("缺少 TDLib fileId")
         requestSession.onDataSpecOpened(
             position = position,
@@ -337,8 +346,11 @@ class TelegramMediaDataSource(
             ?.takeIf { size -> size > position }
             ?.minus(position)
             ?: MAX_CURRENT_READ_AHEAD_BYTES
+        val effectiveReadAheadCeiling = dynamicMaxReadAheadBytes?.invoke() ?: maxReadAheadBytes
         return minOf(
-            maxReadAheadBytes,
+            effectiveReadAheadCeiling,
+            if (requestSession.isPreloadOnly()) NextPreloadBudgetControllerBridge.CHUNK_BYTES
+                else MAX_CURRENT_READ_AHEAD_BYTES,
             dataSpecRemaining,
             knownFileRemaining,
         ).coerceAtLeast(requestedLength)
@@ -419,6 +431,7 @@ class TelegramMediaDataSource(
         private val onCurrentRangeLeaseAcquired: ((Boolean) -> Unit)? = null,
         private val ownerKindOverride: TelegramFileOwnerKind? = null,
         private val maxReadAheadBytes: Long = MAX_CURRENT_READ_AHEAD_BYTES,
+        private val dynamicMaxReadAheadBytes: (() -> Long)? = null,
     ) : DataSource.Factory {
         override fun createDataSource(): DataSource = TelegramMediaDataSource(
             gateway = gateway,
@@ -428,12 +441,14 @@ class TelegramMediaDataSource(
             onCurrentRangeLeaseAcquired = onCurrentRangeLeaseAcquired,
             ownerKindOverride = ownerKindOverride,
             maxReadAheadBytes = maxReadAheadBytes,
+            dynamicMaxReadAheadBytes = dynamicMaxReadAheadBytes,
         )
     }
 
     companion object {
         const val SCHEME = "telegram-file"
         const val DEFAULT_CHUNK_SIZE_BYTES = 256L * 1024L
+        const val INITIAL_REQUIRED_BYTES = 64L * 1024L
         const val MAX_CURRENT_READ_AHEAD_BYTES = 4L * 1024L * 1024L
         const val DEFAULT_TIMEOUT_MILLIS = 15_000L
         private val EMPTY_HEADERS: Map<String, List<String>> = emptyMap()

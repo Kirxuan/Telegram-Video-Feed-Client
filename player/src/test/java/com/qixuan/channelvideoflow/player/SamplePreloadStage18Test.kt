@@ -35,12 +35,12 @@ class SamplePreloadStage18Test {
                 ),
                 peakBitrateBitsPerSecond = 1_000_000L,
                 cachedCoveredBytes = 0L,
-                downloadedNewNetworkBytes = 0L,
+                requestedUncachedBytes = 0L,
             ),
         )
 
         val metadata = decision(12.0)
-        val blocked = decision(7.0)
+        val blocked = decision(2.5)
         assertEquals(NextPreloadBudgetTier.METADATA_ONLY, metadata.allowedBudgetTier)
         assertEquals(0L, metadata.calculatedTargetBytes)
         assertTrue(metadata.permitsSamplePreload())
@@ -49,7 +49,7 @@ class SamplePreloadStage18Test {
     }
 
     @Test
-    fun featureStaysOffUntilMeasuredP95ImprovesByFifteenPercent() {
+    fun screeningRequiresRelativeAndAbsoluteImprovementAndNeverChangesDefault() {
         assertFalse(BuildConfig.SAMPLE_QUEUE_PRELOAD_ENABLED)
         val belowGate = SamplePreloadAbEvaluator.evaluate(
             baselineMillis = List(30) { 300L },
@@ -60,15 +60,17 @@ class SamplePreloadStage18Test {
         )
         val pass = SamplePreloadAbEvaluator.evaluate(
             baselineMillis = List(30) { 300L },
-            candidateMillis = List(30) { 250L },
+            candidateMillis = List(30) { 225L },
             firstFrameCount = 30,
             transitionCount = 30,
             safetyFailures = 0,
         )
 
-        assertFalse(belowGate.enableByDefault)
-        assertTrue(pass.enableByDefault)
+        assertFalse(belowGate.screeningPassed)
+        assertTrue(pass.screeningPassed)
         assertTrue(pass.improvementFraction >= 0.15)
+        assertTrue(pass.sampleCountComplete)
+        assertTrue(pass.wastedBytesWithinLimit)
     }
 
     @Test
@@ -76,13 +78,38 @@ class SamplePreloadStage18Test {
         assertFalse(
             SamplePreloadAbEvaluator.evaluate(
                 List(30) { 300L }, List(30) { 100L }, 29, 30, 0,
-            ).enableByDefault,
+            ).screeningPassed,
         )
         assertFalse(
             SamplePreloadAbEvaluator.evaluate(
                 List(30) { 300L }, List(30) { 100L }, 30, 30, 1,
-            ).enableByDefault,
+            ).screeningPassed,
         )
+    }
+
+    @Test
+    fun insufficientSamplesOrMoreThanTwentyFivePercentWasteFailsTheGate() {
+        assertFalse(
+            SamplePreloadAbEvaluator.evaluate(
+                baselineMillis = List(29) { 300L },
+                candidateMillis = List(29) { 100L },
+                firstFrameCount = 29,
+                transitionCount = 29,
+                safetyFailures = 0,
+            ).screeningPassed,
+        )
+        val excessiveWaste = SamplePreloadAbEvaluator.evaluate(
+            baselineMillis = List(30) { 300L },
+            candidateMillis = List(30) { 100L },
+            firstFrameCount = 30,
+            transitionCount = 30,
+            safetyFailures = 0,
+            baselineSkippedNextWastedBytes = List(30) { 1_000L },
+            candidateSkippedNextWastedBytes = List(30) { 1_251L },
+        )
+
+        assertFalse(excessiveWaste.wastedBytesWithinLimit)
+        assertFalse(excessiveWaste.screeningPassed)
     }
 
     @Test
@@ -139,6 +166,53 @@ class SamplePreloadStage18Test {
         assertEquals(2, gateway.requests)
     }
 
+    @Test
+    fun standbyReadAheadCannotEscapeReservedRangeButCurrentPlaybackCanReadAhead() {
+        val gateway = RecordingGateway()
+        val session = PlaybackRangeRequestSession(preloadOnly = true)
+        val ledger = SampleRequestBudget()
+        val capped = CappedNextSampleGateway(gateway, setOf(10), 1_024L, session, ledger)
+
+        capped.acquireRange(
+            10, 768L, 256L, TelegramFileRequestPriority.NEXT_PRELOAD,
+            "next", TelegramFileOwnerKind.NEXT_PRELOAD, 512L * 1024L,
+        ).close()
+        assertEquals(256L, gateway.lastReadAheadBytes)
+        assertEquals(256L, ledger.reservedBytes)
+
+        session.promoteToCurrent()
+        capped.acquireRange(
+            10, 1_024L, 256L, TelegramFileRequestPriority.CURRENT_STARTUP,
+            "current", TelegramFileOwnerKind.CURRENT_PLAYBACK, 512L * 1024L,
+        ).close()
+        assertEquals(512L * 1024L, gateway.lastReadAheadBytes)
+        assertEquals(256L, ledger.reservedBytes)
+    }
+
+    @Test
+    fun poolParsesSparseIndexAndManifestWithinOneBudgetThenRestoresForegroundReadAhead() {
+        val gateway = RecordingGateway()
+        val session = PlaybackRangeRequestSession(preloadOnly = true)
+        val ledger = SampleRequestBudget()
+        val capped = CappedNextSampleGateway(gateway, setOf(10), 1_024L, session, ledger,
+            allowSparsePayloadRanges = true)
+        capped.acquireRange(10, 10_000_000L, 512L, TelegramFileRequestPriority.NEXT_PRELOAD,
+            "index", TelegramFileOwnerKind.NEXT_PRELOAD, 512L).close()
+        capped.acquireRange(99, 0L, 512L, TelegramFileRequestPriority.NEXT_PRELOAD,
+            "manifest", TelegramFileOwnerKind.NEXT_PRELOAD, 512L).close()
+        assertEquals(1_024L, ledger.reservedBytes)
+        assertThrows(IllegalArgumentException::class.java) {
+            capped.acquireRange(10, 0L, 1L, TelegramFileRequestPriority.NEXT_PRELOAD,
+                "over-budget", TelegramFileOwnerKind.NEXT_PRELOAD, 1L)
+        }
+        assertEquals(2, gateway.requests)
+        session.promoteToCurrent()
+        capped.acquireRange(10, 0L, 512L, TelegramFileRequestPriority.CURRENT_STARTUP,
+            "active", TelegramFileOwnerKind.CURRENT_PLAYBACK, 4L * 1024 * 1024).close()
+        assertEquals(4L * 1024 * 1024, gateway.lastReadAheadBytes)
+        assertEquals(1_024L, ledger.reservedBytes)
+    }
+
     private fun video(id: Int) = IndexedVideo(
         key = VideoKey(1L, id.toLong()),
         fileId = id,
@@ -157,6 +231,7 @@ class SamplePreloadStage18Test {
 
     private class RecordingGateway : TelegramFileGateway {
         var requests = 0
+        var lastReadAheadBytes = 0L
         override fun acquireRange(
             fileId: Int,
             offset: Long,
@@ -167,6 +242,7 @@ class SamplePreloadStage18Test {
             readAheadBytes: Long,
         ): TelegramFileRangeLease {
             requests += 1
+            lastReadAheadBytes = readAheadBytes
             return object : TelegramFileRangeLease {
                 override val fileId = fileId
                 override val offset = offset

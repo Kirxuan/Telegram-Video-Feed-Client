@@ -26,6 +26,7 @@ function Assert-True {
 $percentileInput = @(100L, 200L, 300L, 400L, 500L)
 Assert-Equal 300L (Get-NearestRankPercentile -Values $percentileInput -Percentile 50) 'P50'
 Assert-Equal 500L (Get-NearestRankPercentile -Values $percentileInput -Percentile 90) 'P90'
+Assert-Equal 500L (Get-NearestRankPercentile -Values $percentileInput -Percentile 95) 'P95'
 
 $defaultFastBatches = @(Get-CvfFastSwipeBatches -SwipeCount 10 -CheckpointEvery 0)
 $checkpointFastBatches = @(Get-CvfFastSwipeBatches -SwipeCount 10 -CheckpointEvery 3)
@@ -48,6 +49,9 @@ $lines = @(
     '07-30 12:00:02.235 I/CVF-TdFile: request begin fileId=9 owner=CURRENT_PLAYBACK priority=CURRENT_STARTUP offset=0 limit=262144 result=MERGE',
     '07-30 12:00:02.236 I/CVF-TdFile: cancel fileId=9 result=DISJOINT_SWITCH',
     '07-30 12:00:02.237 I/CVF-TdFile: range timeout fileId=9 offset=0 length=262144 waitMs=15000 firstByteMs=null progressBytes=0 reason=NO_PROGRESS',
+    '07-30 12:00:02.238 I/CVF-Preload: action=DECISION skippedNextWastedBytes=131072',
+    '07-30 12:00:02.239 I/CVF-FeedPerf: summary firstEmissionMs=12 hydrateMs=7 visibleFirstFrameMs=44 snapshotKeys=80 hydratedItems=9',
+    '07-30 12:00:02.240 I/CVF-CachePerf: summary touchWrites=3 eventReceived=20 eventApplied=8 eventCoalesced=12',
     '07-30 12:00:02.300 I/CVF-Player: state state=BUFFERING rebufferCount=1 activeRebufferMs=0',
     '07-30 12:00:02.400 E/AndroidRuntime: FATAL EXCEPTION: main',
     '07-30 12:00:02.401 E/AndroidRuntime: Process: com.qixuan.channelvideoflow, PID: 1234'
@@ -58,6 +62,7 @@ Assert-Equal 2 $summary.OutcomeCounts.FIRST_FRAME 'first frame count'
 Assert-Equal 1 $summary.OutcomeCounts.FAILED 'failed count'
 Assert-Equal 200L $summary.Metrics.bindToTerminalMs.P50 'bind P50'
 Assert-Equal 300L $summary.Metrics.bindToTerminalMs.P90 'bind P90'
+Assert-Equal 300L $summary.Metrics.bindToTerminalMs.P95 'bind P95'
 Assert-Equal 2 $summary.PromotedCount 'promoted count'
 Assert-Equal 2 $summary.PromotedEligibleCount 'promoted denominator only uses successful samples'
 Assert-Equal 2 $summary.OrderCounts.RANDOM 'random order count'
@@ -102,6 +107,15 @@ Assert-Equal 1 $summary.TelegramRangeCancelCount 'Telegram range cancel count'
 Assert-Equal 1 $summary.NoProgressTimeoutCount 'no-progress timeout count'
 Assert-Equal 18L $summary.OwnerHandoffMetric.P90 'owner handoff P90'
 Assert-Equal 1 $summary.RebufferCount 'rebuffer count'
+Assert-Equal 131072L $summary.SkippedNextWastedMetric.Total 'skipped next waste bytes'
+Assert-Equal 50 $summary.PreloadHitRatePercent 'preload hit rate'
+Assert-Equal 12L $summary.FeedInitialEmissionMetric.P50 'feed first emission (subscription latency, not SQL execution) P50'
+Assert-Equal 7L $summary.FeedHydrationMetric.P50 'feed hydration P50'
+Assert-Equal 44L $summary.VisibleFirstFrameMetric.P50 'visible first frame P50'
+Assert-Equal 3L $summary.CacheTouchWrites 'cache touch writes'
+Assert-Equal 20L $summary.TdFileEventsReceived 'TDLib file events received'
+Assert-Equal 8L $summary.TdFileEventsApplied 'TDLib file events applied'
+Assert-Equal 12L $summary.TdFileEventsCoalesced 'TDLib file events coalesced'
 Assert-Equal 1 $summary.CrashCount 'target package crash count'
 Assert-True (-not (Test-CvfRequestedDirection -Summary $summary -Direction Forward)) 'mixed directions cannot confirm Forward'
 Assert-True (-not (Test-CvfRequestedDirection -Summary $summary -Direction Reverse)) 'mixed directions cannot confirm Reverse'
@@ -156,6 +170,21 @@ $latest = ConvertFrom-CvfBenchmarkLog -Lines @(
 ) -PackageName 'com.qixuan.channelvideoflow'
 Assert-True (-not $latest.RandomOrderConfirmed) 'LATEST must never satisfy RANDOM baseline'
 
+$memInfo = ConvertFrom-CvfMemInfo -Lines @(' TOTAL PSS:      123456            TOTAL RSS: 222222')
+Assert-True $memInfo.Available 'modern meminfo must parse'
+Assert-Equal 123456L $memInfo.PssKb 'PSS kilobytes'
+$gfxInfo = ConvertFrom-CvfGfxInfo -Lines @('Total frames rendered: 200', 'Janky frames: 10 (5.00%)')
+Assert-True $gfxInfo.Available 'gfxinfo must parse'
+Assert-Equal 5 $gfxInfo.JankyRatePercent 'jank rate'
+
+$blankMemInfo = ConvertFrom-CvfMemInfo -Lines @('', ' TOTAL PSS: 123456', '')
+Assert-Equal 123456L $blankMemInfo.PssKb 'dumpsys blank lines must be accepted'
+Assert-True (-not (ConvertFrom-CvfMemInfo -Lines @('')).Available) 'blank memory output stays unavailable'
+Assert-True (-not (ConvertFrom-CvfGfxInfo -Lines @('')).Available) 'blank frame output stays unavailable'
+$blankLog = ConvertFrom-CvfBenchmarkLog -Lines @('', ' ') -PackageName 'com.qixuan.channelvideoflow'
+Assert-Equal 0 $blankLog.SuccessfulSampleCount 'blank log lines cannot manufacture samples'
+Assert-Equal 0 @(Protect-CvfBenchmarkLog -Lines @('')).Count 'blank log lines are not evidence'
+
 $missingFields = ConvertFrom-CvfBenchmarkLog -Lines @(
     'I/CVF-Transition: summary outcome=FIRST_FRAME promoted=true bindToTerminalMs=4'
 ) -PackageName 'com.qixuan.channelvideoflow'
@@ -170,7 +199,7 @@ Assert-True ($runner -match "ValidateSet\('Forward', 'Reverse'\)") 'runner must 
 Assert-True ($runner -match 'directionConfirmed') 'runner must compare observed and requested direction'
 Assert-True ($runner -match '-not \$directionConfirmed') 'runner must fail on direction mismatch'
 Assert-True ($runner -match 'Test-CvfRequestedDirection') 'runner must use the tested direction check'
-Assert-True ($runner -match "ValidateSet\('stage13b', 'stage13c', 'stage13d', 'stage13e', 'stage13f', 'stage18'\)") 'runner must constrain evidence stages through stage 18'
+Assert-True ($runner -match "'stage25a', 'stage25f', 'stage25g'") 'runner must constrain Stage 25 evidence routes'
 Assert-True ($runner -match "ReportStage = 'stage13d'") 'runner must keep stage 13D as its default evidence stage'
 Assert-True ($runner -match 'build/reports/\$ReportStage') 'runner must isolate evidence by the requested stage'
 Assert-True ($runner -match "'stage13e' \{ 'Stage 13E random reference resolution benchmark' \}") 'runner must label stage 13E evidence explicitly'
@@ -189,7 +218,11 @@ Assert-True (
 Assert-True ($runner -match 'RandomRoundBoundaryPlanPromotedCount') 'runner must report atomic random-boundary plan promotion'
 Assert-True ($runner -match 'PromotionAttemptCount') 'runner must report owner promotion attempts'
 Assert-True ($runner -match 'OwnerHandoffMetric') 'runner must report owner handoff latency'
-Assert-True ($runner -match 'Test-CvfRandomSelectedUiTree') 'runner must use the tested RANDOM UI semantics gate'
+Assert-True ($runner -match 'Test-CvfPlaybackUiTree') 'runner must use the tested playback route gate'
+Assert-True (Test-CvfPlaybackUiTree '<?xml version="1.0"?><hierarchy><node package="com.qixuan.channelvideoflow" content-desc="返回频道" /></hierarchy>') 'loading remains a playback route without a play button'
+Assert-True (Test-CvfPlaybackUiTree '<?xml version="1.0"?><hierarchy><node package="com.qixuan.channelvideoflow" content-desc="显示播放控制" /></hierarchy>') 'hidden controls remain a playback route'
+Assert-True (-not (Test-CvfPlaybackUiTree '<?xml version="1.0"?><hierarchy><node package="other.app" content-desc="返回频道" /></hierarchy>')) 'other apps must never receive a benchmark swipe'
+Assert-True (-not (Test-CvfPlaybackUiTree 'ERROR: no idle root')) 'missing UI tree must not authorize a gesture'
 Assert-True (
     $runner -notmatch 'if \(\$summary\.SuccessfulSampleCount -gt 0\) \{ return \$true \}'
 ) 'initial playback gate must not be bypassed by an arbitrary prior first-frame log'
@@ -201,5 +234,82 @@ Assert-True (
 Assert-True ($runner -match 'Fast batch sizes') 'report must disclose the measured Fast batch protocol'
 Assert-True ($runner -match 'StartupRangeObservationComplete') 'runner must reject missing startup range observation'
 Assert-True ($runner -match 'first uncached DataSpec') 'runner must report first uncached DataSpec categories'
+Assert-True ($runner -match "ValidateSet\('Debug', 'Benchmark'\)") 'runner must expose release-like benchmark build'
+Assert-True ($runner -match 'Get-ProcessMemInfo') 'runner must capture PSS'
+Assert-True ($runner -match 'Get-FrameStats') 'runner must capture gfxinfo jank'
 
+
+$poolSummary = ConvertFrom-CvfBenchmarkLog -Lines @(
+    'I/CVF-Transition: summary outcome=FIRST_FRAME poolPromoted=true poolPreparedReady=true bindToTerminalMs=90',
+    'I/CVF-Transition: summary outcome=FIRST_FRAME poolPromoted=false poolPreparedReady=false bindToTerminalMs=600',
+    'I/CVF-Transition: summary outcome=FAILED poolPromoted=true poolPreparedReady=true bindToTerminalMs=12000'
+) -PackageName 'com.qixuan.channelvideoflow'
+Assert-Equal 1 $poolSummary.PoolReadyHitSampleCount 'only READY pool hits form the prepared subgroup'
+Assert-Equal 90 $poolSummary.PoolReadyHitBindMetric.P95 'pool hit latency does not replace all switches'
+Assert-Equal 1 $poolSummary.OutcomeCounts.FAILED 'failed prepared hits stay in outcome counts'
+
+$feedSummary = ConvertFrom-CvfBenchmarkLog -Lines @(
+    'I/CVF-FeedPerf: summary firstEmissionMs=12 hydrateMs=null observationGapMs=null snapshotKeys=80 hydratedItems=null',
+    'I/CVF-FeedPerf: summary firstEmissionMs=null hydrateMs=null observationGapMs=60000 snapshotKeys=80 hydratedItems=null',
+    'I/CVF-FeedPerf: summary firstEmissionMs=null hydrateMs=7 observationGapMs=null snapshotKeys=null hydratedItems=9'
+) -PackageName 'com.qixuan.channelvideoflow'
+Assert-Equal 1 $feedSummary.FeedInitialEmissionMetric.Count 'idle gaps and hydration are not zero-time queries'
+Assert-Equal 12 $feedSummary.FeedInitialEmissionMetric.P95 'subscription latency excludes idle time'
+Assert-Equal 1 $feedSummary.FeedHydrationMetric.Count 'unmeasured hydration events do not bias percentiles'
+Assert-Equal 7 $feedSummary.FeedHydrationMetric.P95 'hydration includes only actual measurements'
+
+# Exercise the real collector with overlapping/rotated logcat snapshots, without adb.
+$collectorAst = [System.Management.Automation.Language.Parser]::ParseInput($runner, [ref]$null, [ref]$null)
+$collector = $collectorAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-MainLogLines' }, $true)
+. ([scriptblock]::Create($collector.Extent.Text))
+$mainLogHistory = [Collections.Generic.List[string]]::new()
+$mainLogSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$mockSnapshot = @('09-10 01:00:00.001 I/CVF-Transition: summary outcome=FIRST_FRAME', '09-10 01:00:01.001 I/CVF-Transition: summary outcome=FAILED')
+function Invoke-Adb { param($AdbArguments) return ,$mockSnapshot }
+$Serial = 'fixture'
+$firstSnapshot = @(Get-MainLogLines)
+$mockSnapshot = @($mockSnapshot[1], '09-10 01:00:02.001 I/CVF-Transition: summary outcome=FIRST_FRAME')
+$rotatedSnapshot = @(Get-MainLogLines)
+Assert-Equal 2 $firstSnapshot.Count 'first snapshot captured'
+Assert-Equal 3 $rotatedSnapshot.Count 'rotation preserves earlier outcomes without duplicate overlap'
+Assert-Equal $firstSnapshot[0] $rotatedSnapshot[0] 'earliest first frame survives log rotation'
+
+$readiness = ConvertFrom-CvfBenchmarkLog -Lines @(
+    'I/CVF-Transition: summary outcome=FIRST_FRAME chatId=1 messageId=2 bindToReadyMs=null bindToTerminalMs=80',
+    'I/CVF-Player: playable chatId=1 messageId=2 bindToReadyMs=2500',
+    'I/CVF-Player: playable chatId=1 messageId=3 bindToReadyMs=10',
+    'I/CVF-Player: state state=BUFFERING rebufferCount=1',
+    'I/CVF-Player: sample state=BUFFERING rebufferCount=1',
+    'I/CVF-Player: summary state=BUFFERING rebufferCount=1',
+    'I/CVF-Player: state state=BUFFERING rebufferCount=0',
+    'I/CVF-Player: state state=BUFFERING rebufferCount=1'
+) -PackageName 'com.qixuan.channelvideoflow'
+Assert-Equal 2 $readiness.RebufferCount 'cumulative log repetitions are not new rebuffer events'
+Assert-Equal 1 $readiness.PlayableReadyMetric.Count 'only observed transition targets enter readiness statistics'
+Assert-Equal 2500 $readiness.PlayableReadyMetric.P50 'a still frame at 80ms is not playable READY'
+
+# A just-cleared device log has no lines. Exercise the actual wait path, including
+# PowerShell's empty-pipeline semantics, rather than feeding a synthetic empty array.
+foreach ($name in @('Get-TerminalCount', 'Wait-ForTerminalAfter')) {
+    $definition = $collectorAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$PackageName = 'com.qixuan.channelvideoflow'
+$mainLogHistory.Clear()
+$mainLogSeen.Clear()
+$mockSnapshot = @()
+Assert-Equal $false (Wait-ForTerminalAfter -PreviousCount 0 -TimeoutSeconds 1) 'empty log times out without a parameter-binding crash'
+$mockSnapshot = @(
+    'I/CVF-Transition: summary outcome=FIRST_FRAME chatId=1 messageId=2 bindToReadyMs=null bindToTerminalMs=80',
+    'I/CVF-Player: playable chatId=1 messageId=2 bindToReadyMs=2500'
+)
+Assert-Equal $true (Wait-ForTerminalAfter -PreviousCount 0 -PreviousReadyCount 0 -TimeoutSeconds 1) 'collection recovers once a real frame and playable event arrive'
+$initialWait = $collectorAst.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Wait-ForInitialPlayback'
+}, $true)
+. ([scriptblock]::Create($initialWait.Extent.Text))
+$PlaybackReadyTimeoutSeconds = 0
+Assert-Equal $false (Wait-ForInitialPlayback) 'a status message cannot make failed page verification truthy'
 Write-Output 'SWIPE_BENCHMARK_SCRIPT_TEST_RESULT=PASS'

@@ -2,7 +2,6 @@ package com.qixuan.channelvideoflow.telegram.media
 
 import android.util.Log
 import com.qixuan.channelvideoflow.database.MediaCacheEntryDao
-import com.qixuan.channelvideoflow.database.MediaCacheEntryEntity
 import com.qixuan.channelvideoflow.domain.media.TelegramFileGateway
 import com.qixuan.channelvideoflow.domain.media.TelegramFileDeleteResult
 import com.qixuan.channelvideoflow.domain.media.TelegramFileOwnerKind
@@ -61,6 +60,9 @@ internal class TelegramFileManager(
     private val internalResources = mutableMapOf<String, InternalResourceEntry>()
     private var accountGeneration = 0L
     private var nextOwnerSequence = 0L
+    private val cacheMetadataWriter = cacheEntryDao?.let { dao ->
+        MediaCacheMetadataWriter(dao, scope)
+    }
 
     init {
         scope.launch {
@@ -222,7 +224,7 @@ internal class TelegramFileManager(
                         ensureRequestLocked(fileId, entry)
                     }
                 }
-                cacheEntryDao?.delete(fileId)
+                cacheMetadataWriter?.delete(fileId)
                 TelegramFileDeleteResult.DELETED
             }
             is TelegramClientResult.Failure -> {
@@ -547,6 +549,7 @@ internal class TelegramFileManager(
     }
 
     private fun clearForLogout() {
+        cacheMetadataWriter?.resetAndClear()
         synchronized(lock) {
             accountGeneration += 1L
             internalResources.clear()
@@ -734,15 +737,31 @@ internal class TelegramFileManager(
             availableSnapshot(entry, owner) != null || owner.prefixProbeState == PrefixProbeState.PENDING
         }
         if (unsatisfied.isEmpty()) return
+        // Playback owners steer the download window. A residual preload owner for the same file
+        // (e.g. the unfinished tail chunk of a "next" preparation that was promoted into
+        // playback) must not pull the active request back to its older offset: that produced
+        // cancel/SWITCH loops where the download window oscillated between the last preload
+        // chunk and the playback read-ahead, and every oscillation could cancel in-flight
+        // parts. Already-downloaded bytes stay in TDLib; unread parts are covered by the
+        // playback request's own read-ahead as consumption advances.
+        //
+        // The ownership test looks at *all* owners, not just the unsatisfied ones: during
+        // playback the consumption leases are satisfied most of the time (the player reads
+        // data that is already local), and in those windows the leftover preload owner would
+        // otherwise become the only unsatisfied owner and steer the window backwards again —
+        // the exact oscillation this guard exists to remove. Files that are not playing are
+        // unaffected: preload owners still steer their own downloads.
+        val steering = selectSteeringOwners(entry, unsatisfied)
+        if (steering.isEmpty()) return
         if (
-            unsatisfied.all { owner ->
+            steering.all { owner ->
                 owner.priority == TelegramFileRequestPriority.NEXT_PRELOAD
             } &&
             hasForegroundBlockerLocked()
         ) {
             return
         }
-        val plan = planRequest(unsatisfied, entry.snapshot)
+        val plan = planRequest(steering, entry.snapshot)
         var action = RequestAction.START
         var cancelFirst = false
         entry.activeRequest?.let { active ->
@@ -762,30 +781,42 @@ internal class TelegramFileManager(
                 active.offset <= plan.requiredStart &&
                 active.end >= plan.requiredEnd
             ) {
-                if (reuseContainedActiveRequest) {
-                    val previousPriority = active.priority
-                    // plan already reflects the highest-priority unsatisfied owner. Use it exactly
-                    // so first-frame STARTUP -> CONTINUATION still yields other-file preload.
-                    active.priority = plan.priority
-                    active.ownerKind = plan.ownerKind
-                    if (!active.started.get()) {
+            if (reuseContainedActiveRequest) {
+                val previousPriority = active.priority
+                val previousKind = active.ownerKind
+                // plan already reflects the highest-priority unsatisfied owner. Use it exactly
+                // so first-frame STARTUP -> CONTINUATION still yields other-file preload.
+                active.priority = plan.priority
+                active.ownerKind = plan.ownerKind
+                val changed = previousPriority != active.priority ||
+                    previousKind != active.ownerKind
+                if (!active.started.get()) {
+                    if (changed) {
                         trace(
                             "request reprioritize fileId=$fileId owner=${active.ownerKind} " +
                                 "priority=$previousPriority->${active.priority} " +
                                 "offset=${active.offset} limit=${active.length} result=QUEUED",
                         )
-                        return
                     }
-                    trace(
-                        "request reprioritize fileId=$fileId owner=${active.ownerKind} " +
-                            "priority=$previousPriority->${active.priority} " +
-                            "offset=${active.offset} limit=${active.length} result=REUSED_ACTIVE",
-                    )
-                    updateActiveRequestPriority(fileId, entry, active)
                     return
                 }
-                action = RequestAction.REPRIORITIZE
-                active.cancelled.set(true)
+                // Only publish to TDLib when something actually changed. A sequential read
+                // advances the lease every chunk while the priority and owner stay identical;
+                // re-publishing the same request made every chunk boundary a fresh
+                // downloadFile call whose streaming-offset update could disturb in-flight
+                // parts, and device evidence showed hundreds of such calls per hundred
+                // seconds. The active request still covers the new range, so silence is safe.
+                if (!changed) return
+                trace(
+                    "request reprioritize fileId=$fileId owner=${active.ownerKind} " +
+                        "priority=$previousPriority->${active.priority} " +
+                        "offset=${active.offset} limit=${active.length} result=REUSED_ACTIVE",
+                )
+                updateActiveRequestPriority(fileId, entry, active)
+                return
+            }
+            action = RequestAction.REPRIORITIZE
+            active.cancelled.set(true)
             } else
             if (!active.started.get()) {
                 active.offset = minOf(active.offset, plan.offset)
@@ -945,6 +976,19 @@ internal class TelegramFileManager(
         }
     }
 
+    private fun selectSteeringOwners(
+        entry: FileEntry,
+        unsatisfied: List<OwnerRange>,
+    ): List<OwnerRange> {
+        val playbackOwned = entry.owners.values.any { owner ->
+            owner.ownerKind == TelegramFileOwnerKind.CURRENT_PLAYBACK
+        }
+        if (!playbackOwned) return unsatisfied
+        return unsatisfied.filter { owner ->
+            owner.ownerKind == TelegramFileOwnerKind.CURRENT_PLAYBACK
+        }
+    }
+
     private fun planRequest(
         unsatisfied: List<OwnerRange>,
         snapshot: TelegramFileSnapshot?,
@@ -1073,22 +1117,18 @@ internal class TelegramFileManager(
     }
 
     private fun touchLocked(fileId: Int, entry: FileEntry) {
-        entry.lastAccessedAtMillis = nowMillis()
+        entry.lastAccessedAtMillis = maxOf(entry.lastAccessedAtMillis, nowMillis())
         persistEntryLocked(fileId, entry, entry.snapshot?.downloadedSize ?: 0L)
     }
 
     private fun persistEntryLocked(fileId: Int, entry: FileEntry, cachedBytes: Long) {
-        val dao = cacheEntryDao ?: return
+        val writer = cacheMetadataWriter ?: return
         val lastAccessedAt = entry.lastAccessedAtMillis.takeIf { it > 0L } ?: nowMillis()
-        scope.launch {
-            dao.upsert(
-                MediaCacheEntryEntity(
-                    fileId = fileId,
-                    cachedBytes = cachedBytes.coerceAtLeast(0L),
-                    lastAccessedAtMillis = lastAccessedAt,
-                ),
-            )
-        }
+        writer.record(
+            fileId = fileId,
+            cachedBytes = cachedBytes,
+            lastAccessedAtMillis = lastAccessedAt,
+        )
     }
 
     private fun trace(message: String) {

@@ -26,6 +26,7 @@ class TagFilterViewModel @Inject constructor(
     messageRepository: TelegramMessageRepository,
 ) : ViewModel() {
     private val selection = MutableStateFlow(TagSelection())
+    private val observationRetry = MutableStateFlow(0L)
 
     private val availableTags = chatRepository.channels
         .map { channels ->
@@ -35,14 +36,16 @@ class TagFilterViewModel @Inject constructor(
                 .toSet()
         }
         .distinctUntilChanged()
-        .flatMapLatest { channelIds ->
+        .combine(observationRetry) { channelIds, retry -> channelIds to retry }
+        .flatMapLatest { (channelIds, _) ->
             if (channelIds.isEmpty()) {
                 flowOf(TagSource(channelIds = emptySet(), tags = emptyList()))
             } else {
-                messageRepository.observeTags(channelIds).map { tags ->
+                messageRepository.observeTagObservation(channelIds).map { observation ->
                     TagSource(
                         channelIds = channelIds,
-                        tags = tags.map(::SearchableTag),
+                        tags = observation.value.map(::SearchableTag),
+                        failure = observation.failure,
                     )
                 }
             }
@@ -69,6 +72,7 @@ class TagFilterViewModel @Inject constructor(
             selectedNames = validSelection,
             mode = selected.mode,
             searchQuery = selected.searchQuery,
+            observationFailure = source.failure,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -103,6 +107,10 @@ class TagFilterViewModel @Inject constructor(
         selection.update { current -> current.copy(normalizedNames = emptySet()) }
     }
 
+    fun retryObservation() {
+        observationRetry.value += 1L
+    }
+
     fun currentFilter(): VideoFilter = uiState.value.toFilter()
 
     private data class TagSelection(
@@ -114,5 +122,6 @@ class TagFilterViewModel @Inject constructor(
     private data class TagSource(
         val channelIds: Set<Long>,
         val tags: List<SearchableTag>,
+        val failure: com.qixuan.channelvideoflow.domain.message.RepositoryObservationFailure? = null,
     )
 }

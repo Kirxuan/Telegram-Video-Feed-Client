@@ -1,5 +1,27 @@
 # VELORA（曜流）验收测试
 
+> 当前设备授权（2026-09-10）：Stage 27 使用红米 Note 11 Pro+ / Android 13，实体机禁止条款仅为旧阶段历史。加载性能只要求移动数据且必须关闭 Wi-Fi，不要求 Wi-Fi 成绩；每条 adb 写操作显式选择目标。Stage 27 Proof 覆盖秒级预算（5 秒目标/20MiB 上限）、移动数据下 3 秒准入、480p 备用、分档起播门槛（含 800ms/1200ms/1800ms/2500ms 四档与未知条件回退）、两实例/单音频和后台释放。真机成绩与 host/emulator Proof 分开，见 [Stage 27](STAGE27_MOBILE_FAST_START.md)。
+>
+> 仪器限制：本机 PowerShell 工具宿主无法执行原生进程（adb 输出与退出码均不可见），因此本轮真机证据由同一 adb 手势与相同 `CVF-Transition`/`CVF-Player` 字段的采集器收集，证据保存在 `build/reports/stage27/`。仓库正式仪器仍是 `scripts/run-swipe-first-frame-benchmark.ps1`，本轮同时修复了它无法被 Windows PowerShell 5.1 解析的编码问题（缺少 UTF-8 BOM）。
+>
+> Stage 27 本轮 Proof 结果：编译 `test lint assembleDebug` PASS；跨模块与变体共 1616 次测试执行，失败/错误/跳过均为 0；API 36 AOSP x86_64 emulator Compose UI `OK (101 tests)`、目标包 crash 0；红米覆盖安装、`MainActivity` topResumed、冷启动 1400ms、crash 记录 0。真机移动数据为三轮各 20 次前滑，快速路径（≤500ms 完成切换）三轮均为 4–6 次，但 P50 在 1784–7246ms 之间波动，**不作可归因的提升声明**。详见 [Stage 27](STAGE27_MOBILE_FAST_START.md)。
+
+## Stage 25 收尾验证（2026-09-09，未发布）
+
+| 项目 | 本次结果与边界 |
+|---|---|
+| 全屏入口 | 现有横屏定位修复重新安装后通过；共享用例断言完整边界在 Pager 内、48dp 实际像素高度、触摸进入/退出和元数据恢复。不能用语义存在替代屏幕可见和实际触摸。 |
+| 尺寸矩阵 | API 36 AOSP x86_64；小屏大字、横屏、平板各 40/40，通过后恢复 size/density/font。 |
+| 常规 Compose | 最新 APK 101/101 通过，含上述入口用例。 |
+| 主机 Proof | 完整 test、lint、debug/release 及 instrumentation target/test 编译通过；app 三个普通变体各 146 项、instrumentation unit 250 项，player 三变体各 128 项，telegram 三变体各 165 项，model 6 项、domain 72 项；没有失败、错误或跳过。不同变体不当作独立用例累计。 |
+| 历史 Robolectric 阻塞 | Android 16 MavenArtifactFetcher 曾有 27 条依赖初始化失败，属于外部环境；本次现有配置正常重跑已恢复。没有复制受限缓存、换 SDK、删测试或放宽检查。 |
+| 静态候选 | Release 两项权限/备份/native/凭证零命中、R8 体积、TDLib 新库加密与 16KiB ELF/APK 对齐分别记录；以 [Stage 25 结果](STAGE25_OPTIMIZATION_RESULTS.md) 和 [产物清单](STAGE25_ARTIFACTS.md) 为准。 |
+| 实体机 | 实体 iQOO 12 未连接、未探测、未安装、未操作；性能、Codec、PSS、图形缓冲、能耗和真实账号路径尚未验证。完整 Path B 的真机 install+launch 项仍尚未验证。 |
+
+当前工作树默认启用 C1 双播放器；SampleQueue/C2 仍为独立待验收候选。主机/模拟器通过不能代替移动数据连续性验收；备用 READY 还须满足正式起播缓冲，不能仅统计静止首帧。以下 Stage 24 和更早章节属于既有版本历史，不能覆盖本轮设备限制。
+
+> Stage 25 当前轮次不允许任何实体机操作。主机、API 36 AOSP x86_64 Compose/Room、实际 Media3 池与 EGL 测试及后续设备清单见 [Stage 25 实施结果](STAGE25_OPTIMIZATION_RESULTS.md) 和 [设备验收清单](STAGE25_DEVICE_ACCEPTANCE.md)。下文历史通过数量不代表当前工作树。16KiB 静态 ELF/APK 对齐使用 `scripts/verify-native-pages.py` 独立检验；运行时兼容尚未验证。
+
 文档版本：3.5
 日期：2026-09-02
 状态：Stage 24 已实施用户自行配置、Keystore 加密文件和凭证变更后的客户端重建；1106 项主机测试、lint、debug/release 构建、正式签名和凭证反向扫描通过。仓库所有者报告当前版本真机安装与正常使用通过；本次正式签名 APK 的设备安装、真实 Keystore instrumentation 与逐项账号证据未由 Codex 重复验证。

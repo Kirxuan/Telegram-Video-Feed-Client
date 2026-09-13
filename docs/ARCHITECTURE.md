@@ -1,8 +1,10 @@
 # VELORA（曜流）架构设计
 
-文档版本：2.5
-日期：2026-09-01
-状态：Stage 24 在既有授权边界内增加用户自行配置、Android Keystore 加密存储和凭证变更后的唯一 TDLib Client 安全重建；播放器、Room、缓存和权限边界未改变
+> 当前合同（2026-09-10）：Stage 27 在固定 ACTIVE/STANDBY 双播放器基础上把预加载预算改为**按秒**（目标 5 秒、硬上限 20MiB），低清 480p 备用与分档快速起播用于缩短移动数据首帧与真正可播放时间；不再要求先做单播放器实验。最多两实例、只有 ACTIVE 发声；移动数据显式授权贯穿策略/预算/池准入；手势开始保留精确下一目标，稳定后按账号/质量/网络/队列代次校验交接。正常目标改变清除旧媒体并复用槽位，后台和资源压力释放备用。详见 [Stage 27](STAGE27_MOBILE_FAST_START.md) 与 [方案调研](STAGE27_GITHUB_LOADING_RESEARCH.md)，下文各阶段描述保留为历史。
+
+文档版本：2.7
+日期：2026-09-10
+状态：Stage 27 移动数据秒开优化；正式发行基线仍为 Stage 24。固定最多两实例，唯一下一目标以秒为预算、低清预留、手势保留与精确晋升；架构边界仍使用官方 TDLib、Media3 与唯一私有缓存。
 
 > 阶段 5 已新增 `player`、`TelegramFileManager`、`TelegramMediaDataSource` 和单例 `VideoPlayerManager`。阶段 6 以一个 `PlayerView` 和该唯一播放器驱动 `VerticalPager`。阶段 7 在稳定当前项之外只把逻辑下一项交给 `VideoPreloadManager`，请求 256KiB、优先级 8 的 TDLib 区间；当前播放仍为优先级 32 且不存在第二播放器。阶段 8 补齐音频焦点、耳机拔出策略、解码错误分类、播放器完整释放、受保护窗口标志和系统返回路径，并把启动期文件统计及设备信号读取移到显式 I/O dispatcher。阶段 9 修正已知文件长度的 Media3 返回语义，把范围等待从固定总截止改为 15 秒无进展截止加 90 秒硬上限，并使 owner 释放立即唤醒等待线程。阶段 10 增加不持久化的 Debug 播放会话指标，将初始加载、暂停和 seek 与真实 rebuffer 分开，并用真机基线验证缓冲前瞻及释放行为。阶段 11 在稳定绑定时刷新官方消息，从 `alternativeVideos` 中选择直接 H.264 服务端版本，并让当前播放与唯一下一条预加载共享同一质量策略。`TdLibMediaCacheManager` 继续使用官方精确存储统计和 `FileTypeVideo` 删除能力，以运行时 pin、Room v4 LRU 与 DataStore 配额限制唯一 TDLib 私有媒体缓存。
 
@@ -194,7 +196,7 @@ close 必须幂等：关闭文件句柄、释放 ownerToken，并通过 owner �
 - 第一版只选择 Telegram 提供的直接 H.264 文件。刷新失败、超过 3 秒、候选无效或无更低成本候选时使用索引原画；不做本地转码、HLS 或播放中无缝切换。
 - 使用 ProgressiveMediaSource 和 TelegramMediaDataSource.Factory。
 - 由播放器管理器以 250ms 节奏采样 position、duration、bufferedPosition 和 seekable 状态，作为不可变快照交给 ViewModel；`seekTo` 在该边界内校验时长和 seekable 后调用 ExoPlayer。暂停、切页、释放和播放错误会停止采样任务。
-- LoadControl 优先按播放时间维持 50–60 秒缓冲；首次开始阈值为 2.5 秒，rebuffer 后的恢复阈值为 12 秒，以避免高码率视频反复短暂恢复。
+- LoadControl 优先按播放时间维持 50–60 秒缓冲；rebuffer 后的恢复阈值固定为 12 秒，以避免高码率视频反复短暂恢复。首次开始阈值不再固定为 2.5 秒：`conditionalStartupMillis` 按观测吞吐余量分档（低清 800ms / 1200ms，高清晰度 1800ms，未知或弱网 2500ms），未满足条件时自动退回保守值。
 - Debug 会在播放器状态变化和每 5 秒采样时记录 position、bufferedPosition、前瞻毫秒、rebuffer 次数及累计时长，并在释放绑定时输出汇总。只有首次 READY 后、仍期望自动播放且不是显式 seek 的 BUFFERING 才计为 rebuffer；指标不保存视频元数据，Release 不输出详细日志。
 - 以 Media3 `AudioAttributes` 配置媒体/电影内容和自动音频焦点处理，并启用 `handleAudioBecomingNoisy`。
 - `ProgressiveMediaSource` 使用最多 3 次的显式加载重试；解码器初始化、查询、解码和格式类错误统一映射为 `DECODER_UNSUPPORTED`，网络超时映射为 `TIMEOUT`。
@@ -437,9 +439,9 @@ Android 策略观察器组合：
 - `TdLibTelegramMessageRepository` 把 `AlternativeVideo.video` 与 `AlternativeVideo.hlsFile` 映射为应用自有描述符；`TdApi.*`、manifest 和临时 fileId/token 不越过 telegram 边界，也不进入 Room。
 - HLS 使用与项目相同的稳定 Media3 1.10.1 `HlsMediaSource`。严格 parser 只把 Telegram 内部资源重写为绑定账号 generation 的短期 opaque URI；所有 segment/MAP/byterange 最终仍由 `TelegramFileManager` 执行 TDLib offset/limit。
 - `StreamingNetworkMetricsEstimator` 只接收 active TDLib 新网络字节，排除缓存和本地读取；fast/slow EWMA、TTFB 分位数和 network generation 输入纯 Kotlin `PlaybackRiskController`，后者约束同一播放器的 Media3 adaptive tracks。
-- 下一条仍只有一个。`NextPreloadBudgetController` 以 current reservoir 决定 0/metadata/2/5/10 MiB tier，以可播放秒数和峰值码率/segment boundary 得到实际目标；512 KiB chunk 后重新评估，新增网络绝不超过 10 MiB。
+- 下一条仍只有一个。`NextPreloadBudgetController` 以 current reservoir 决定 0/metadata/2/5/10/20 MiB tier，以**目标秒数（5 秒）**和峰值码率/segment boundary 得到实际字节目标；512 KiB chunk 后重新评估。Stage 25 曾把未缓存请求预算限制到 10 MiB，Stage 27 改为 20 MiB 硬上限配合秒级目标；请求字节不是传输层实际网络字节。
 - Media3 `DefaultPreloadManager`/`PreloadMediaSource` 只能在相同 builder 创建的唯一 ExoPlayer 上交接，且 gateway/owner gate 不能绕过 duration/bytes 上限。manager 只管理正式 current 与唯一 next；8～15 秒档只到 track selection 且 payload cap=0，交接为 current 后同一 request session 才解除 preload cap。该 SampleQueue 层有独立 flag，真实 A/B 通过前默认关闭。
-- HLS 解析/读取/解码失败在同一 ExoPlayer 上单次回退 direct MP4；不创建播放器池、HTTP proxy、SimpleCache 或第二媒体缓存。
+- HLS 解析/读取/解码失败在同一 ExoPlayer 上单次回退 direct MP4；该 Stage 18 默认路径不创建播放器池、HTTP proxy、SimpleCache 或第二媒体缓存；Stage 25 的独立双池候选见下文。
 
 Feature flags：`cvfTelegramHlsEnabled=true`、`cvfHybridAbrEnabled=true`、`cvfDynamicNextPreloadEnabled=true`、`cvfSampleQueuePreloadEnabled=false`。
 
@@ -452,7 +454,24 @@ Feature flags：`cvfTelegramHlsEnabled=true`、`cvfHybridAbrEnabled=true`、`cvf
 - 视频沉浸式栏由生命周期感知 effect 复用既有控制器；内容可绘制到系统栏之后，交互层使用 safe content/safe drawing，退出、后台或销毁时恢复系统栏和方向。
 - API 36 未复现必须使用 exclusion 的边缘冲突，因此不设置 `systemGestureExclusion`。
 
-## 20. 官方依据
+## 20. Stage 25 工作树候选（2026-09-09）
+
+正式版本仍为 Stage 24 / 1.1.0；当前工作树结果见 `STAGE25_OPTIMIZATION_RESULTS.md`。
+
+- Feed 通过 `PlaybackFeedSession` 保持复合键和随机轮次；Room 输出轻量键，窗口内才水合完整视频/标签。排序已正确时只做线性检查。仍保留 O(N) 键与两轮随机顺序，不声称已经实现 O(1) 全局 Feed。
+- Repository 的 `RepositoryObservation` 区分空结果与数据库失败，失败保留最近内容；最多三次自动订阅尝试，取消直接传播，UI 显式重试重新订阅。
+- `PlaybackTargetCoordinator` 管理 pager 意图；`PlaybackPreparationContext` 绑定账号、质量、网络、队列和轮次，传入播放器准备与最终绑定。
+- 单播放器仍为默认。`cvfPlaybackPoolCandidate=C1|C2` 接入真实 `ReusablePlayerLifecycle`，最多两个 ExoPlayer；STANDBY 只有一个目标，静音、关闭音频焦点、`playWhenReady=false`。旧 ACTIVE 先暂停/撤销焦点/清空，再交接新 ACTIVE。
+- C1 不附加持久输出；C2 使用 `StandbyVideoSurface` + Media3 `EGLSurfaceTexture` 消费离屏帧。只对可保存内容使用 C2，保护内容走 C1；EGL 创建失败退至 C1。后台和释放关闭 EGL 线程与备用引擎。
+- C1/C2 使用和单播放器相同的 HLS/MP4 选择与回退，不通过改变表示层制造对比收益。预加载读取仍经过同一个 TDLib Gateway；取消不返还目标生命周期内的未缓存请求预算。
+- ACTIVE 首帧由 `AnalyticsListener` 校验回调的实际输出为当前 `PlayerView` 的可见 `SurfaceView`，离屏输出和旧代次回调不计入。该指标是显示 Surface 的渲染回调代理，合成器最终呈现仍需设备帧时间/视觉复核。
+- `benchmark` 保留脱敏播放诊断以便四种候选可比较；生产 `release` 编译关闭。SampleQueue 和双池构建时互斥；Owner Promotion 保持关闭。
+- 缓存元数据按 fileId 合并，最多 256 个待写键及有界删除集合，批量 Room 事务、三次有限重试；退出清理失败后阻止新账号写入。SQLite 写入只使用 API 26 可用的 INSERT/UPDATE。
+- 横屏视频的全屏入口沿用 `LandscapeFullscreenPrompt`：按实际视口约束计算 fit 后的视频高度，按钮 y 坐标不超过预留底部信息区后的上限。回归用例检查按钮完整边界位于 Pager 内、实测像素高度达到当前 density 下的 48dp，并以触摸事件验证进入和退出；不改变播放器、显示 Surface 或方向所有权。
+
+## 21. 官方依据
+
+Stage 27 追加策略（2026-09-10）：AUTO 的 NEXT 计划优先冻结真实 480p 版本（短边上限 480，缺失时退结合法省流源），滑动晋升沿用该计划；显式原画/720p 设置仍受尊重。池预算改为**秒优先**：目标是备够 5 秒，字节数由峰值码率推导（含 1.25 峰值余量），硬上限 20MiB，取消不退款。移动数据下当前缓冲达到 3 秒且缓冲未下降即允许开始准备；池安全层不再单独重复 8 秒门槛，改为直接消费预算决策，避免同一事实出现两个阈值。备用样本与请求上限同为 20MiB，ACTIVE 样本上限仍为 32MiB，备用以实际缓冲 5 秒停止加载。首次起播门槛按吞吐余量分档：低清（短边≤480）且快慢吞吐较低值≥2.0×平均码率且首字节 P90≤350ms 用 800ms；同条件余量≥1.6×且首字节 P90≤500ms 用 1200ms；更高清晰度仅在余量≥2.5×且首字节 P90≤500ms 时用 1800ms；未知或弱网保留 2500ms，重缓冲恢复门槛不降。此条覆盖历史 Stage 25/26 的 2MiB/10MiB 与 3 秒说明；原理与来源见 STAGE27_GITHUB_LOADING_RESEARCH.md，验证见 STAGE27_MOBILE_FAST_START.md。
 
 - [Android build 配置与 minorApiLevel](https://developer.android.com/build)
 - [Android 16 QPR2 SDK 36.1 设置与 AGP 下限](https://developer.android.com/about/versions/16/qpr2/setup-sdk)

@@ -1,6 +1,7 @@
 *.iml
 .gradle/
 .gradle-user-home/
+.gradle-local/
 .kotlin/
 .idea/
 local.properties
@@ -28,3 +29,5 @@ tdlib-build/
 *.aab
 .DS_Store
 Thumbs.db
+.workbuddy/qa/
+.workbuddy/

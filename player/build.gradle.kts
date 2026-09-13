@@ -26,6 +26,19 @@ val telegramHlsEnabled = booleanProperty("cvfTelegramHlsEnabled", true)
 val hybridAbrEnabled = booleanProperty("cvfHybridAbrEnabled", true)
 val dynamicNextPreloadEnabled = booleanProperty("cvfDynamicNextPreloadEnabled", true)
 val sampleQueuePreloadEnabled = booleanProperty("cvfSampleQueuePreloadEnabled", false)
+val playbackPoolCandidate = providers.gradleProperty("cvfPlaybackPoolCandidate")
+    // Production ships the bounded C1 pool. C2 and SampleQueue remain explicit, mutually
+    // exclusive experiment candidates; C1 has no offscreen output and is the safer default.
+    .orElse("C1")
+    .get()
+    .also { value ->
+        require(value in setOf("DISABLED", "C1", "C2")) {
+            "cvfPlaybackPoolCandidate must be DISABLED, C1, or C2"
+        }
+    }
+require(!sampleQueuePreloadEnabled || playbackPoolCandidate == "DISABLED") {
+    "SampleQueue and the two-player pool are mutually exclusive experiments"
+}
 val startupRangeCandidate = providers.gradleProperty("cvfStartupRangeCandidate")
     .orElse("BASELINE")
     .get()
@@ -85,15 +98,31 @@ android {
             "SAMPLE_QUEUE_PRELOAD_ENABLED",
             sampleQueuePreloadEnabled.toString(),
         )
+        buildConfigField("String", "PLAYBACK_POOL_CANDIDATE", "\"$playbackPoolCandidate\"")
     }
 
     buildFeatures {
         buildConfig = true
     }
 
+    buildTypes {
+        create("benchmark") {
+            initWith(getByName("release"))
+            matchingFallbacks += "release"
+        }
+        configureEach {
+            // Same sanitized instrumentation for every experiment, never for production release.
+            buildConfigField("boolean", "PLAYBACK_DIAGNOSTICS_ENABLED", (name != "release").toString())
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
     }
 
 }
@@ -117,4 +146,7 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.runner)
 }

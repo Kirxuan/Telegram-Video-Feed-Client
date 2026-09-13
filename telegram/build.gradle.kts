@@ -7,6 +7,11 @@ plugins {
     alias(libs.plugins.hilt.android)
 }
 
+val tdLibDatabaseEncryptionCandidateEnabled = providers
+    .gradleProperty("cvfTdLibDatabaseEncryptionCandidateEnabled")
+    .map(String::toBooleanStrict)
+    .orElse(false)
+
 android {
     namespace = "com.qixuan.channelvideoflow.telegram"
 
@@ -19,10 +24,25 @@ android {
     defaultConfig {
         minSdk = 26
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField(
+            "boolean",
+            "TDLIB_DATABASE_ENCRYPTION_CANDIDATE_ENABLED",
+            tdLibDatabaseEncryptionCandidateEnabled.get().toString(),
+        )
     }
 
     buildFeatures {
         buildConfig = true
+    }
+
+    buildTypes {
+        create("benchmark") {
+            initWith(getByName("release"))
+            matchingFallbacks += listOf("release")
+        }
+        configureEach {
+            buildConfigField("boolean", "PERFORMANCE_DIAGNOSTICS_ENABLED", (name != "release").toString())
+        }
     }
 
     compileOptions {
