@@ -15,6 +15,7 @@
 | 文件 | 官方文件 SHA-256 |
 |---|---|
 | `com.google.guava:guava-parent:33.3.1-jre` 的 POM | `55441db27e8869dfefe053059bdf478bdc7e95585642bf391f0023345fd56287` |
+| `com.google.guava:guava-parent:33.3.1-android` 的 POM（第二轮运行时依赖检查发现） | `6e11986ea7250b51f847157e2dc937f32a306804dfce0007a5e81ddb9b95c579` |
 | `org.junit:junit-bom:5.10.2` 的 Gradle module 元数据 | `de23b114b3e4119a8fe6eb17bed5a3852816698bace67071579d6d927ebb080a` |
 | `org.jetbrains.kotlinx:kotlinx-coroutines-bom:1.8.0` 的 POM | `1239e9dbe1397cd5971342956b2511bc3ace7b641842e4372a088dcfa8b9ad55` |
 
@@ -26,6 +27,8 @@
 
 - 修复前：最小 Gradle 工程 `verifyCiMetadata --dependency-verification=strict` 失败，列出与云端相同的三个制品。
 - 修复后：同一工程、同一命令通过，三个制品均被校验。
+- 独立空缓存下的完整项目 `help` 也复现了最初三个校验失败（4m41s）；已有缓存的本机成功不能替代此项。
+- 第二次云端运行通过根项目配置，在 `:app:checkBenchmarkAarMetadata` 发现缺少 Guava Android 版父 POM。将其加入独立配置的最小复现，确认先失败，登记官方文件 SHA-256 后再验证。
 - 云端完整流程：修复推送后验证，以 GitHub Actions 对应提交结果为准；本文首次提交时尚未验证。
 
 原始运行：[Android host proof #1](https://github.com/Kirxuan/Telegram-Video-Feed-Client/actions/runs/34740965194)。后续状态以仓库 [Actions](https://github.com/Kirxuan/Telegram-Video-Feed-Client/actions) 中修复提交对应的运行记录为准。
