@@ -29,6 +29,8 @@
 - 修复后：同一工程、同一命令通过，三个制品均被校验。
 - 独立空缓存下的完整项目 `help` 也复现了最初三个校验失败（4m41s）；已有缓存的本机成功不能替代此项。
 - 第二次云端运行通过根项目配置，在 `:app:checkBenchmarkAarMetadata` 发现缺少 Guava Android 版父 POM。将其加入独立配置的最小复现，确认先失败，登记官方文件 SHA-256 后再验证。
+- 第三次运行推进到 kapt 后发现 `guava-parent:33.0.0-jre` 未登记。进一步核对清单中已有依赖对应的父 POM、BOM 和 Gradle module，补齐 Guava 父 POM `33.0.0-jre` / `33.2.1-jre` / `33.4.8-jre`、Coroutines BOM `1.6.4` 与 JUnit BOM `5.9.2` 的 module，共计补充九个元数据文件；不改变依赖版本或现有校验值。
+- 最小复现中的各版本使用独立 configuration，避免 Gradle 版本冲突消解使某个待验证版本被替换。错误哈希负向对照仍触发严格校验失败。
 - 云端完整流程：修复推送后验证，以 GitHub Actions 对应提交结果为准；本文首次提交时尚未验证。
 
 原始运行：[Android host proof #1](https://github.com/Kirxuan/Telegram-Video-Feed-Client/actions/runs/34740965194)。后续状态以仓库 [Actions](https://github.com/Kirxuan/Telegram-Video-Feed-Client/actions) 中修复提交对应的运行记录为准。
