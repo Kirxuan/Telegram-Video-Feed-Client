@@ -64,4 +64,5 @@ jobs:
             app/build/reports/lint-results-*.html
             build/reports/stage25k/release-boundaries/*
             build/reports/stage25-experiments/native-pages.json
+            build/reports/dependency-verification/**
           if-no-files-found: warn
