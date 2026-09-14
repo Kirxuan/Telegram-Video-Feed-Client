@@ -65,4 +65,5 @@ jobs:
             build/reports/stage25k/release-boundaries/*
             build/reports/stage25-experiments/native-pages.json
             build/reports/dependency-verification/**
+            **/build/test-results/**/TEST-*.xml
           if-no-files-found: warn

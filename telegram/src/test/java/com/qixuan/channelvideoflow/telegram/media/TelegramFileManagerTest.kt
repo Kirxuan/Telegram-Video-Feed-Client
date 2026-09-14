@@ -18,6 +18,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
@@ -1272,8 +1273,10 @@ class TelegramFileManagerTest {
         )
         val executor = Executors.newSingleThreadExecutor()
         val waitStarted = CountDownLatch(1)
+        val loaderThread = AtomicReference<Thread>()
         val result = executor.submit(
             Callable {
+                loaderThread.set(Thread.currentThread())
                 waitStarted.countDown()
                 lease.awaitAvailable(5_000L)
             },
@@ -1281,12 +1284,24 @@ class TelegramFileManagerTest {
 
         try {
             assertTrue(waitStarted.await(1, TimeUnit.SECONDS))
+            // Task entry does not mean awaitAvailable has passed its closed-lease guard.
+            // Observe the timed monitor wait so this tests waking a blocked loader,
+            // rather than racing close() against the beginning of awaitAvailable().
+            val loader = loaderThread.get()
+            val waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (
+                loader.state != Thread.State.TIMED_WAITING &&
+                !result.isDone && System.nanoTime() < waitDeadline
+            ) {
+                Thread.sleep(1L)
+            }
+            assertEquals("Loader must be blocked before cancellation", Thread.State.TIMED_WAITING, loader.state)
             lease.close()
 
             val failure = assertThrows(ExecutionException::class.java) {
                 result.get(1, TimeUnit.SECONDS)
             }
-            assertTrue(failure.cause is TelegramFileUnavailableException)
+            assertTrue("Unexpected waiting-loader failure: ${failure.cause}", failure.cause is TelegramFileUnavailableException)
         } finally {
             lease.close()
             executor.shutdownNow()
